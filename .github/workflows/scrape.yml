@@ -27,7 +27,7 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install --upgrade --cache-dir ~/.cache/pip -r requirements.txt
 
       - name: Discover categories
         id: get-categories
@@ -43,7 +43,7 @@ jobs:
     needs: discover
     
     strategy:
-      max-parallel: 10  # Run all categories in parallel
+      max-parallel: 4  # Limit to 4 categories in parallel
       fail-fast: false  # Continue other jobs if one fails
       matrix:
         category: ${{ fromJSON(needs.discover.outputs.categories) }}
@@ -69,7 +69,7 @@ jobs:
 
       # ── 3. Install dependencies ─────────────────────────────────────────────
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install --upgrade --cache-dir ~/.cache/pip -r requirements.txt
 
       # ── 4. Run scraper for specific category ───────────────────────────────
       - name: Run Bleems scraper - ${{ matrix.category }}
