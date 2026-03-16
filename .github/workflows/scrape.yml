@@ -1,0 +1,85 @@
+name: Bleems Scraper → S3
+
+on:
+  # Run every day at 02:00 UTC
+  schedule:
+    - cron: "0 2 * * *"
+
+  # Also allow manual runs from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  # ── Job 1: Discover categories dynamically ───────────────────────────────
+  discover:
+    name: Discover Categories
+    runs-on: ubuntu-latest
+    outputs:
+      categories: ${{ steps.get-categories.outputs.categories }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Discover categories
+        id: get-categories
+        run: |
+          CATEGORIES=$(python scraper.py --list-categories)
+          echo "categories=$CATEGORIES" >> $GITHUB_OUTPUT
+          echo "Discovered categories: $CATEGORIES"
+
+  # ── Job 2: Scrape each category in parallel ──────────────────────────────
+  scrape:
+    name: Scrape ${{ matrix.category }}
+    runs-on: ubuntu-latest
+    needs: discover
+    
+    strategy:
+      max-parallel: 10  # Run all categories in parallel
+      fail-fast: false  # Continue other jobs if one fails
+      matrix:
+        category: ${{ fromJSON(needs.discover.outputs.categories) }}
+
+    env:
+      # ── AWS credentials & bucket ──────────────────────────────────────────
+      AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION:    us-east-1
+      S3_BUCKET_NAME:        ${{ secrets.S3_BUCKET_NAME }}
+
+    steps:
+      # ── 1. Checkout code ────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ────────────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # ── 3. Install dependencies ─────────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Run scraper for specific category ───────────────────────────────
+      - name: Run Bleems scraper - ${{ matrix.category }}
+        run: python scraper.py --category "${{ matrix.category }}"
+
+      # ── 5. (Optional) Confirm files landed in S3 ───────────────────────────
+      - name: Verify S3 upload
+        run: |
+          aws s3 ls s3://${{ secrets.S3_BUCKET_NAME }}/bleems-data/ --recursive --human-readable \
+            | grep "${{ matrix.category }}" \
+            | tail -10
+
+
