@@ -131,9 +131,28 @@ def fetch_all_shops() -> list[dict]:
         result = []
         for el in soup.select("a.brand-a-z-list-item"):
             href     = el.get("href", "")
-            slug     = href.split("/shop/")[-1].rstrip("/") if "/shop/" in href else ""
-            img      = el.select_one("img")
             name_div = el.select_one(".brand-a-z-item-name")
+            name     = (name_div.text.strip() if name_div else el.get("data-name", "")).strip()
+            
+            # Extract slug from href - try multiple patterns
+            slug = ""
+            if "/shop/" in href and "javascript:" not in href:
+                slug = href.split("/shop/")[-1].rstrip("/")
+            elif href.startswith("/") and "javascript:" not in href:
+                # Try to extract last segment of path as potential slug
+                parts = [p for p in href.split("/") if p]
+                if len(parts) >= 2:  # e.g., /kw/some-shop
+                    slug = parts[-1]
+            else:
+                # Website changed: href is now javascript:void(0)
+                # Use data-name to construct slug
+                data_name = el.get("data-name", "")
+                if data_name:
+                    # Convert to URL-friendly slug: lowercase, replace spaces/special chars with hyphens
+                    slug = re.sub(r'[^\w\s-]', '', data_name.lower())  # Remove special chars
+                    slug = re.sub(r'[-\s]+', '-', slug).strip('-')     # Replace spaces/hyphens with single hyphen
+            
+            img      = el.select_one("img")
             type_div = el.select_one(".brand-a-z-item-type")
 
             if use_data_attr:
@@ -144,13 +163,16 @@ def fetch_all_shops() -> list[dict]:
                     else el.get("data-type", "Other").strip()
                 )
 
+            # Construct shop URL using the slug
+            shop_url = f"{BASE_URL}/{COUNTRY}/shop/{slug}" if slug else ""
+            
             result.append({
-                "name":          (name_div.text.strip() if name_div else el.get("data-name", "")).strip(),
+                "name":          name,
                 "type":          type_text.title(),
                 "rating":        el.get("data-rating", ""),
                 "ratings_count": el.get("data-count", ""),
                 "slug":          slug,
-                "url":           f"{BASE_URL}{href}" if href.startswith("/") else href,
+                "url":           shop_url,
                 "logo_url":      img.get("src", "") if img else "",
             })
         return result
