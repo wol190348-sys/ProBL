@@ -290,17 +290,33 @@ def _collect_product_urls(shop_html: str) -> list[tuple[str, str]]:
 
 
 def _row_from_track_json(data: dict, shop: dict) -> dict:
-    """Build a flat item CSV row from a parsed trackJson dict."""
+    """
+    Build a flat item CSV row from a parsed trackJson dict.
+    
+    IMPORTANT: Uses trackJson's shop_name and category as source of truth,
+    not the page context, since shop pages show products from multiple shops.
+    """
     flavors = data.get("flavor", [])
     colors  = data.get("color",  [])
+    
+    # Use actual shop from trackJson, fallback to page context
+    actual_shop_name = data.get("shop_name", shop["name"])
+    actual_category = data.get("category", shop["type"])
+    
+    # trackJson uses 'price_per', not 'product_price'
+    price = data.get("product_price") or data.get("price_per", "")
+    
+    # trackJson uses 'product_name', not 'product'
+    product_name = data.get("product_name") or data.get("product", "")
+    
     return {
-        "shop_name":    shop["name"],
-        "shop_type":    shop["type"],
+        "shop_name":    actual_shop_name,
+        "shop_type":    actual_category,
         "product_id":   data.get("content_id", ""),
-        "product_name": data.get("product", "").strip(),
-        "category":     data.get("category", ""),
+        "product_name": product_name.strip() if product_name else "",
+        "category":     actual_category,
         "brand":        data.get("brand", ""),
-        "price":        data.get("product_price", ""),
+        "price":        str(price),
         "currency":     data.get("currency", "KWD"),
         "occasion":     data.get("occasion", ""),
         "product_type": data.get("product_type", ""),
@@ -870,6 +886,23 @@ def main():
 
         # S3 key prefix: bleems-data/year=2026/month=02/day=21/Flowers/
         prefix = f"{S3_FOLDER}/year={S3_YEAR}/month={S3_MONTH}/day={S3_DAY}/{shop_type}"
+
+        # Deduplicate items by product_id (same product appears on multiple shop pages)
+        items_before_dedup = len(all_items)
+        seen_product_ids = set()
+        deduped_items = []
+        for item in all_items:
+            pid = item.get("product_id")
+            if pid and pid not in seen_product_ids:
+                seen_product_ids.add(pid)
+                deduped_items.append(item)
+            elif not pid:
+                # Keep items without product_id (fallback cases)
+                deduped_items.append(item)
+        
+        if items_before_dedup > len(deduped_items):
+            log.info(f"  Deduplicated items: {items_before_dedup} → {len(deduped_items)} (removed {items_before_dedup - len(deduped_items)} duplicates)")
+        all_items = deduped_items
 
         # Count images uploaded
         shops_with_images = sum(1 for s in enriched if s.get("s3_image_path"))
