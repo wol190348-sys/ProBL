@@ -2,3 +2,7 @@ debug_items.py
 debug_ads_vs_products.py
 debug_trackjson.py
 test_attribution_fix.py
+debug_itemblock.py
+test_product_filtering.py
+analyze_all_products.py
+test_final_fix.py

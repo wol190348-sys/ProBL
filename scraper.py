@@ -274,18 +274,45 @@ def _extract_track_json(html: str) -> dict | None:
         return None
 
 
-def _collect_product_urls(shop_html: str) -> list[tuple[str, str]]:
+def _collect_product_urls(shop_html: str, shop_slug: str) -> list[tuple[str, str]]:
     """
     Return a list of (product_url, div_target_key) tuples from a shop page.
-    Each .dv-item-head[data-content-target] carries the relative product path.
+    
+    Collects all product cards on the page, then filters to only include:
+    - Products that belong to this specific shop (by checking shop_slug in URL)
+    - Excludes sponsored ads (contains ?source=ad)
+    
+    NOTE: #itemBlock often contains only 1 product, with others loaded via JS.
+    We scan all .dv-item-card elements instead.
     """
     soup = BeautifulSoup(shop_html, "html.parser")
     seen, pairs = set(), []
-    for div in soup.select(".dv-item-head[data-content-target]"):
+    
+    # Get all product cards on the page
+    # (Can't rely on #itemBlock as it only shows initial/featured products)
+    for card in soup.select(".dv-item-card"):
+        div = card.select_one(".dv-item-head[data-content-target]")
+        if not div:
+            continue
+            
         target = div.get("data-content-target", "").strip().lstrip("/")
-        if target and target not in seen:
+        if not target:
+            continue
+            
+        # Skip sponsored ads (they have ?source=ad parameter)
+        if "?source=ad" in target or "&source=ad" in target:
+            continue
+        
+        # Verify product belongs to this shop by checking if shop slug is in the URL
+        # Expected format: confectionery/22-march/barbie or flower/shop-name/product
+        if shop_slug and shop_slug not in target:
+            # Product from another shop - skip it
+            continue
+        
+        if target not in seen:
             seen.add(target)
             pairs.append((f"{BASE_URL}/{COUNTRY}/{target}", target))
+    
     return pairs
 
 
@@ -336,7 +363,8 @@ def fetch_shop_items(shop_html: str, shop: dict, s3: "boto3.client") -> list[dic
     Downloads and uploads product images to S3.
     Falls back to minimal row (product_id + image only) if a page fails.
     """
-    pairs    = _collect_product_urls(shop_html)
+    shop_slug = shop.get("slug", "")
+    pairs    = _collect_product_urls(shop_html, shop_slug)
     shop_soup = BeautifulSoup(shop_html, "html.parser")
 
     # Build lookup: target_key → div, for fallback metadata
@@ -360,33 +388,88 @@ def fetch_shop_items(shop_html: str, shop: dict, s3: "boto3.client") -> list[dic
             resp.encoding = 'utf-8'  # Ensure Arabic text is decoded correctly
             if resp.status_code == 200:
                 data = _extract_track_json(resp.text)
+                
+                # If trackJson not found, try parsing HTML directly
+                if not data:
+                    log.debug(f"    No trackJson, parsing HTML for {prod_url}")
+                    prod_soup = BeautifulSoup(resp.text, "html.parser")
+                    
+                    # Extract from product detail page HTML structure
+                    title_el = prod_soup.select_one("h1.product-title")
+                    price_el = prod_soup.select_one("#lblPrice.price")
+                    shop_link = prod_soup.select_one("h1.product-title + span a")
+                    desc_el = prod_soup.select_one("p.product-desc")
+                    img_el = prod_soup.select_one("img.product-main-image, .product-images img")
+                    
+                    if title_el:
+                        # Build data dict from HTML
+                        data = {
+                            "product_name": title_el.text.strip(),
+                            "shop_name": shop_link.text.strip() if shop_link else shop["name"],
+                            "price_per": price_el.text.replace("KWD", "").strip() if price_el else "",
+                            "category": shop["type"],
+                            "product_url": prod_url,
+                            "product_image_url": img_el.get("src", "") if img_el else "",
+                        }
+                        # Try to extract product ID from hidden input or URL
+                        pid_input = prod_soup.select_one("#AddToCart_FlowerId")
+                        if pid_input:
+                            data["content_id"] = pid_input.get("value", "")
+                        
         except requests.RequestException as exc:
             log.debug(f"    Product fetch error {prod_url}: {exc}")
 
         if data:
             item = _row_from_track_json(data, shop)
         else:
-            # Minimal fallback row from shop listing div
+            # Fallback: extract from shop listing div
             div = div_lookup.get(target_key)
-            pid    = div.get("data-content-name", "").replace("Product_", "") if div else ""
-            img_el = div.select_one("img") if div else None
-            item = {
-                "shop_name":    shop["name"],
-                "shop_type":    shop["type"],
-                "product_id":   pid,
-                "product_name": "",
-                "category":     "",
-                "brand":        shop["name"],
-                "price":        "",
-                "currency":     "KWD",
-                "occasion":     "",
-                "product_type": "",
-                "sub_category": "",
-                "flavors":      "",
-                "colors":       "",
-                "product_url":  prod_url,
-                "image_url":    img_el.get("src", "") if img_el else "",
-            }
+            if div:
+                pid = div.get("data-content-name", "").replace("Product_", "")
+                
+                # Try to find more details in the product card
+                parent = div.parent if div.parent else div
+                name_el = parent.select_one(".item-name")
+                price_el = parent.select_one(".item-price")
+                shop_el = parent.select_one(".shop-name")
+                img_el = div.select_one("img")
+                
+                item = {
+                    "shop_name":    shop_el.text.replace("by", "").strip() if shop_el else shop["name"],
+                    "shop_type":    shop["type"],
+                    "product_id":   pid,
+                    "product_name": name_el.text.strip() if name_el else "",
+                    "category":     shop["type"],
+                    "brand":        shop["name"],
+                    "price":        price_el.text.replace("KWD", "").strip() if price_el else "",
+                    "currency":     "KWD",
+                    "occasion":     "",
+                    "product_type": "",
+                    "sub_category": "",
+                    "flavors":      "",
+                    "colors":       "",
+                    "product_url":  prod_url,
+                    "image_url":    img_el.get("src", "") if img_el else "",
+                }
+            else:
+                # Absolute minimal fallback if div not found
+                item = {
+                    "shop_name":    shop["name"],
+                    "shop_type":    shop["type"],
+                    "product_id":   "",
+                    "product_name": "",
+                    "category":     shop["type"],
+                    "brand":        shop["name"],
+                    "price":        "",
+                    "currency":     "KWD",
+                    "occasion":     "",
+                    "product_type": "",
+                    "sub_category": "",
+                    "flavors":      "",
+                    "colors":       "",
+                    "product_url":  prod_url,
+                    "image_url":    "",
+                }
         
         # Download and upload product image to S3
         item["s3_image_path"] = ""
