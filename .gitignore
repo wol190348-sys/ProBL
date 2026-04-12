@@ -6,3 +6,5 @@ debug_itemblock.py
 test_product_filtering.py
 analyze_all_products.py
 test_final_fix.py
+test_actual_slug_extraction.py
+test_slug_mismatch.py

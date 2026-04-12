@@ -279,17 +279,36 @@ def _collect_product_urls(shop_html: str, shop_slug: str) -> list[tuple[str, str
     Return a list of (product_url, div_target_key) tuples from a shop page.
     
     Collects all product cards on the page, then filters to only include:
-    - Products that belong to this specific shop (by checking shop_slug in URL)
+    - Products that belong to this specific shop
     - Excludes sponsored ads (contains ?source=ad)
     
     NOTE: #itemBlock often contains only 1 product, with others loaded via JS.
     We scan all .dv-item-card elements instead.
+    
+    IMPORTANT: Shop slug extraction is unreliable (e.g., "Aroma Cake" → "aroma-cake" 
+    but actual slug is "aromacake"). We extract the ACTUAL slug from product URLs
+    on the page and use that for filtering.
     """
     soup = BeautifulSoup(shop_html, "html.parser")
     seen, pairs = set(), []
     
+    # Extract the ACTUAL shop slug from the first product's shop link
+    # This is more reliable than generating from data-name
+    actual_slug = None
+    first_shop_link = soup.select_one("a.shop-name[href*='/shop/']")
+    if first_shop_link:
+        href = first_shop_link.get("href", "")
+        # Extract: https://www.bleems.com/kw/shop/aromacake → aromacake
+        if "/shop/" in href:
+            actual_slug = href.split("/shop/")[-1].strip("/")
+            log.debug(f"    Extracted actual shop slug from page: '{actual_slug}'")
+    
+    # Fallback: use provided slug if we couldn't extract one
+    if not actual_slug:
+        actual_slug = shop_slug
+        log.debug(f"    Using provided shop slug: '{shop_slug}'")
+    
     # Get all product cards on the page
-    # (Can't rely on #itemBlock as it only shows initial/featured products)
     for card in soup.select(".dv-item-card"):
         div = card.select_one(".dv-item-head[data-content-target]")
         if not div:
@@ -303,9 +322,9 @@ def _collect_product_urls(shop_html: str, shop_slug: str) -> list[tuple[str, str
         if "?source=ad" in target or "&source=ad" in target:
             continue
         
-        # Verify product belongs to this shop by checking if shop slug is in the URL
-        # Expected format: confectionery/22-march/barbie or flower/shop-name/product
-        if shop_slug and shop_slug not in target:
+        # Verify product belongs to this shop by checking if actual slug is in the URL
+        # Expected format: confectionery/aromacake/barbie or flower/shop-name/product
+        if actual_slug and actual_slug not in target:
             # Product from another shop - skip it
             continue
         
