@@ -15,3 +15,7 @@ test_shops_page.py
 test_shop_fetching.py
 test_product_extraction.py
 __pycache__/scraper.cpython-311.pyc
+QUICK_SUMMARY.md
+SCRAPING_EVOLUTION.md
+show_data_quality_comparison.py
+show_workflow_comparison.py
