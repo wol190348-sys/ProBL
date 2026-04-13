@@ -8,3 +8,10 @@ analyze_all_products.py
 test_final_fix.py
 test_actual_slug_extraction.py
 test_slug_mismatch.py
+debug_gifts_page.py
+test_category_filtering.py
+.gitignore
+test_shops_page.py
+test_shop_fetching.py
+test_product_extraction.py
+__pycache__/scraper.cpython-311.pyc

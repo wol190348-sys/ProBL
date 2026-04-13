@@ -129,7 +129,8 @@ def fetch_all_shops() -> list[dict]:
 
     def _parse_shops(use_data_attr: bool) -> list[dict]:
         result = []
-        for el in soup.select("a.brand-a-z-list-item"):
+        # Exclude hidden shops (brand-a-z-hidden class) - these are shops from other categories
+        for el in soup.select("a.brand-a-z-list-item:not(.brand-a-z-hidden)"):
             href     = el.get("href", "")
             name_div = el.select_one(".brand-a-z-item-name")
             name     = (name_div.text.strip() if name_div else el.get("data-name", "")).strip()
