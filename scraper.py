@@ -990,22 +990,44 @@ def main():
         # S3 key prefix: bleems-data/year=2026/month=02/day=21/Flowers/
         prefix = f"{S3_FOLDER}/year={S3_YEAR}/month={S3_MONTH}/day={S3_DAY}/{shop_type}"
 
-        # Deduplicate items by product_id (same product appears on multiple shop pages)
+        # Deduplicate items per shop by product_id.
+        # Some product_ids can appear under multiple shops, so global product_id
+        # deduplication can wrongly drop valid shops from items.csv.
         items_before_dedup = len(all_items)
-        seen_product_ids = set()
+        seen_item_keys = set()
         deduped_items = []
         for item in all_items:
             pid = item.get("product_id")
-            if pid and pid not in seen_product_ids:
-                seen_product_ids.add(pid)
+            shop_name = (item.get("shop_name") or "").strip().casefold()
+            if pid:
+                dedup_key = (shop_name, str(pid).strip())
+            else:
+                dedup_key = None
+
+            if dedup_key and dedup_key not in seen_item_keys:
+                seen_item_keys.add(dedup_key)
                 deduped_items.append(item)
-            elif not pid:
+            elif not dedup_key:
                 # Keep items without product_id (fallback cases)
                 deduped_items.append(item)
         
         if items_before_dedup > len(deduped_items):
             log.info(f"  Deduplicated items: {items_before_dedup} → {len(deduped_items)} (removed {items_before_dedup - len(deduped_items)} duplicates)")
         all_items = deduped_items
+
+        # Report shops that ended with zero items so coverage issues are visible.
+        expected_shop_names = {
+            (s.get("name") or "").strip().casefold() for s in enriched if s.get("name")
+        }
+        item_shop_names = {
+            (i.get("shop_name") or "").strip().casefold() for i in all_items if i.get("shop_name")
+        }
+        missing_item_shops = sorted(expected_shop_names - item_shop_names)
+        if missing_item_shops:
+            log.warning(
+                f"  Shops with zero items in output: {len(missing_item_shops)} "
+                f"(sample: {missing_item_shops[:10]})"
+            )
 
         # Count images uploaded
         shops_with_images = sum(1 for s in enriched if s.get("s3_image_path"))
