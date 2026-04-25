@@ -1,0 +1,49 @@
+{
+  "_comment": "Central registry of every CSS selector used by scraper.py. Edit here to fix broken selectors without touching scraper code.",
+
+  "shop_list": {
+    "_page": "/kw/shops",
+    "shop_item":  "a.brand-a-z-list-item:not(.brand-a-z-hidden)",
+    "shop_name":  ".brand-a-z-item-name",
+    "shop_type":  ".brand-a-z-item-type"
+  },
+
+  "product_card": {
+    "_page": "/kw/shop/<slug>",
+    "shop_link":  "a.shop-name[href*='/shop/']",
+    "card":       ".dv-item-card",
+    "head":       ".dv-item-head[data-content-target]"
+  },
+
+  "product_card_fallback": {
+    "_page": "/kw/shop/<slug> (fallback path only)",
+    "item_name":  ".item-name",
+    "item_price": ".item-price",
+    "shop_name":  ".shop-name"
+  },
+
+  "product_detail": {
+    "_page": "/kw/<category>/<shop>/<product>",
+    "title":            "h1.product-title",
+    "price":            "#lblPrice.price",
+    "shop_link":        "h1.product-title + span a",
+    "description":      "p.product-desc",
+    "image":            "img.product-main-image, .product-images img",
+    "product_id_input": "#AddToCart_FlowerId"
+  },
+
+  "shop_ratings": {
+    "_page": "/kw/shop/<slug>",
+    "ratings_container": "span.spn-item-ratings",
+    "rating_stars":      ".rating-on",
+    "ratings_count":     ".fw-bold"
+  },
+
+  "reviews": {
+    "_page": "/kw/shop/<slug>",
+    "review_item":   ".li-reviews",
+    "review_text":   ".dv-reviews-text",
+    "reviewer_name": ".dv-reviews-name",
+    "rating":        ".rating-on"
+  }
+}

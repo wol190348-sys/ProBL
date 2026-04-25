@@ -27,12 +27,26 @@ import time
 import logging
 from io import StringIO, BytesIO
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import boto3
 from botocore.exceptions import ClientError
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Selector registry
+# ──────────────────────────────────────────────────────────────────────────────
+_SELECTORS_FILE = Path(__file__).parent / "selectors.json"
+try:
+    with open(_SELECTORS_FILE, encoding="utf-8") as _f:
+        SEL: dict = json.load(_f)
+except FileNotFoundError:
+    raise FileNotFoundError(
+        f"selectors.json not found at {_SELECTORS_FILE}. "
+        "This file must sit next to scraper.py."
+    )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config
@@ -130,9 +144,9 @@ def fetch_all_shops() -> list[dict]:
     def _parse_shops(use_data_attr: bool) -> list[dict]:
         result = []
         # Exclude hidden shops (brand-a-z-hidden class) - these are shops from other categories
-        for el in soup.select("a.brand-a-z-list-item:not(.brand-a-z-hidden)"):
+        for el in soup.select(SEL["shop_list"]["shop_item"]):
             href     = el.get("href", "")
-            name_div = el.select_one(".brand-a-z-item-name")
+            name_div = el.select_one(SEL["shop_list"]["shop_name"])
             name     = (name_div.text.strip() if name_div else el.get("data-name", "")).strip()
             
             # Extract shop URL directly from onclick attribute (most reliable source)
@@ -150,7 +164,7 @@ def fetch_all_shops() -> list[dict]:
                 shop_url = f"{BASE_URL}/{COUNTRY}/shop/{slug}"
 
             img      = el.select_one("img")
-            type_div = el.select_one(".brand-a-z-item-type")
+            type_div = el.select_one(SEL["shop_list"]["shop_type"])
 
             if use_data_attr:
                 type_text = el.get("data-type", "Other").strip()
@@ -289,7 +303,7 @@ def _collect_product_urls(shop_html: str, shop_slug: str) -> list[tuple[str, str
     # Extract the ACTUAL shop slug from the first product's shop link
     # This is more reliable than generating from data-name
     actual_slug = None
-    first_shop_link = soup.select_one("a.shop-name[href*='/shop/']")
+    first_shop_link = soup.select_one(SEL["product_card"]["shop_link"])
     if first_shop_link:
         href = first_shop_link.get("href", "")
         # Extract: https://www.bleems.com/kw/shop/aromacake → aromacake
@@ -303,8 +317,8 @@ def _collect_product_urls(shop_html: str, shop_slug: str) -> list[tuple[str, str
         log.debug(f"    Using provided shop slug: '{shop_slug}'")
     
     # Get all product cards on the page
-    for card in soup.select(".dv-item-card"):
-        div = card.select_one(".dv-item-head[data-content-target]")
+    for card in soup.select(SEL["product_card"]["card"]):
+        div = card.select_one(SEL["product_card"]["head"])
         if not div:
             continue
             
@@ -382,7 +396,7 @@ def fetch_shop_items(shop_html: str, shop: dict, s3: "boto3.client") -> list[dic
 
     # Build lookup: target_key → div, for fallback metadata
     div_lookup: dict[str, object] = {}
-    for div in shop_soup.select(".dv-item-head[data-content-target]"):
+    for div in shop_soup.select(SEL["product_card"]["head"]):
         key = div.get("data-content-target", "").strip().lstrip("/")
         div_lookup[key] = div
 
@@ -408,11 +422,11 @@ def fetch_shop_items(shop_html: str, shop: dict, s3: "boto3.client") -> list[dic
                     prod_soup = BeautifulSoup(resp.text, "html.parser")
                     
                     # Extract from product detail page HTML structure
-                    title_el = prod_soup.select_one("h1.product-title")
-                    price_el = prod_soup.select_one("#lblPrice.price")
-                    shop_link = prod_soup.select_one("h1.product-title + span a")
-                    desc_el = prod_soup.select_one("p.product-desc")
-                    img_el = prod_soup.select_one("img.product-main-image, .product-images img")
+                    title_el = prod_soup.select_one(SEL["product_detail"]["title"])
+                    price_el = prod_soup.select_one(SEL["product_detail"]["price"])
+                    shop_link = prod_soup.select_one(SEL["product_detail"]["shop_link"])
+                    desc_el = prod_soup.select_one(SEL["product_detail"]["description"])
+                    img_el = prod_soup.select_one(SEL["product_detail"]["image"])
                     
                     if title_el:
                         # Build data dict from HTML
@@ -425,7 +439,7 @@ def fetch_shop_items(shop_html: str, shop: dict, s3: "boto3.client") -> list[dic
                             "product_image_url": img_el.get("src", "") if img_el else "",
                         }
                         # Try to extract product ID from hidden input or URL
-                        pid_input = prod_soup.select_one("#AddToCart_FlowerId")
+                        pid_input = prod_soup.select_one(SEL["product_detail"]["product_id_input"])
                         if pid_input:
                             data["content_id"] = pid_input.get("value", "")
                         
@@ -442,9 +456,9 @@ def fetch_shop_items(shop_html: str, shop: dict, s3: "boto3.client") -> list[dic
                 
                 # Try to find more details in the product card
                 parent = div.parent if div.parent else div
-                name_el = parent.select_one(".item-name")
-                price_el = parent.select_one(".item-price")
-                shop_el = parent.select_one(".shop-name")
+                name_el = parent.select_one(SEL["product_card_fallback"]["item_name"])
+                price_el = parent.select_one(SEL["product_card_fallback"]["item_price"])
+                shop_el = parent.select_one(SEL["product_card_fallback"]["shop_name"])
                 img_el = div.select_one("img")
                 
                 item = {
@@ -779,12 +793,12 @@ def fetch_shop_data(shop: dict, s3: "boto3.client") -> tuple[list[dict], list[di
     soup = BeautifulSoup(html, "html.parser")
 
     # ── Refresh overall rating from page ──────────────────────────────────────
-    rating_span = soup.select_one("span.spn-item-ratings")
+    rating_span = soup.select_one(SEL["shop_ratings"]["ratings_container"])
     if rating_span:
-        rating_on = rating_span.select_one(".rating-on")
+        rating_on = rating_span.select_one(SEL["shop_ratings"]["rating_stars"])
         if rating_on:
             shop["rating"] = _width_to_stars(rating_on.get("style", ""))
-        count_el = rating_span.select_one(".fw-bold")
+        count_el = rating_span.select_one(SEL["shop_ratings"]["ratings_count"])
         if count_el:
             m = re.search(r"\d+", count_el.text)
             if m:
@@ -929,6 +943,10 @@ def main():
         aws_secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY"),
         region_name           = AWS_REGION,
     )
+
+    # ── 0. Selector health check ──────────────────────────────────────────────
+    import selector_health as _health
+    _health.run_health_check(abort_on_failure=False)
 
     # ── 1. Fetch shop list ────────────────────────────────────────────────────
     all_shops = fetch_all_shops()
