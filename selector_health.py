@@ -15,10 +15,12 @@ Usage (called automatically from scraper.main()):
 """
 
 import difflib
+import hashlib
 import json
 import logging
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -61,6 +63,12 @@ def _dom_classes(html: str) -> list[str]:
     """Return every unique CSS class name present anywhere on the page."""
     soup = BeautifulSoup(html, "html.parser")
     return sorted({c for el in soup.find_all(class_=True) for c in el.get("class", [])})
+
+
+def compute_dom_fingerprint(html: str) -> str:
+    """SHA-256 of the sorted, space-joined set of all CSS class names on the page."""
+    classes = _dom_classes(html)
+    return hashlib.sha256(" ".join(classes).encode()).hexdigest()
 
 
 def _suggest(css: str, live_classes: list[str]) -> list[str]:
@@ -115,7 +123,7 @@ def _test_group(
 # Main entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run_health_check(abort_on_failure: bool = False) -> bool:
+def run_health_check(abort_on_failure: bool = False) -> tuple[bool, dict[str, str]]:
     """
     Fetch one sample page per tier and test every CSS selector.
 
@@ -124,7 +132,9 @@ def run_health_check(abort_on_failure: bool = False) -> bool:
       Tier 2  →  /kw/shop/<slug>        (product_card, shop_ratings, reviews)
       Tier 3  →  /kw/<cat>/<shop>/<id>  (product_detail)
 
-    Returns True when all critical selectors matched, False otherwise.
+    Returns (passed, fingerprints) where:
+      passed       — True when all critical selectors matched
+      fingerprints — SHA-256 hash of the CSS class vocabulary per tier
     Raises SystemExit(1) when abort_on_failure=True and any selector is broken.
     """
     with open(SELECTORS_FILE, encoding="utf-8") as f:
@@ -133,7 +143,8 @@ def run_health_check(abort_on_failure: bool = False) -> bool:
     log.info("─" * 60)
     log.info("Selector health check starting …")
 
-    all_results: dict[str, bool] = {}
+    all_results:  dict[str, bool] = {}
+    fingerprints: dict[str, str]  = {}
     fetch_failed = False
 
     # ── Tier 1: shop list page ────────────────────────────────────────────────
@@ -145,6 +156,7 @@ def run_health_check(abort_on_failure: bool = False) -> bool:
 
     if shops_html:
         live_classes = _dom_classes(shops_html)
+        fingerprints["shop_list"] = compute_dom_fingerprint(shops_html)
         r = _test_group("shop_list", selectors["shop_list"], shops_html, live_classes)
         all_results.update(r)
 
@@ -177,6 +189,7 @@ def run_health_check(abort_on_failure: bool = False) -> bool:
 
         if shop_html:
             live_classes = _dom_classes(shop_html)
+            fingerprints["shop_page"] = compute_dom_fingerprint(shop_html)
             r = _test_group("product_card",          selectors["product_card"],          shop_html, live_classes)
             all_results.update(r)
             r = _test_group("product_card_fallback", selectors["product_card_fallback"], shop_html, live_classes, optional=True)
@@ -209,6 +222,7 @@ def run_health_check(abort_on_failure: bool = False) -> bool:
 
         if prod_html:
             live_classes = _dom_classes(prod_html)
+            fingerprints["product_detail"] = compute_dom_fingerprint(prod_html)
             r = _test_group("product_detail", selectors["product_detail"], prod_html, live_classes)
             all_results.update(r)
         else:
@@ -242,4 +256,76 @@ def run_health_check(abort_on_failure: bool = False) -> bool:
     if not passed and abort_on_failure:
         raise SystemExit(1)
 
-    return passed
+    return passed, fingerprints
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DOM fingerprint comparison
+# ──────────────────────────────────────────────────────────────────────────────
+
+def compare_and_store_fingerprints(
+    fingerprints: dict[str, str],
+    s3_client,
+    bucket: str,
+    s3_folder: str,
+) -> None:
+    """
+    Compare today's DOM fingerprints against the last stored ones in S3.
+    Logs a WARNING for any tier whose CSS class vocabulary has changed since
+    the last run — an early signal that a site redesign may break selectors.
+
+    S3 key : <s3_folder>/dom_fingerprints.json
+    Format : {"shop_list": {"hash": "...", "updated": "YYYY-MM-DD"}, ...}
+    """
+    if not bucket:
+        log.debug("  [fingerprint] S3 bucket not configured — skipping")
+        return
+
+    key   = f"{s3_folder}/dom_fingerprints.json"
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # ── Load previous fingerprints from S3 ────────────────────────────────────
+    previous: dict = {}
+    try:
+        resp     = s3_client.get_object(Bucket=bucket, Key=key)
+        previous = json.loads(resp["Body"].read().decode("utf-8"))
+        log.info(f"  [fingerprint] Loaded previous fingerprints from s3://{bucket}/{key}")
+    except Exception:
+        log.info("  [fingerprint] No previous fingerprints found — first run or S3 unavailable")
+
+    # ── Compare tier by tier ──────────────────────────────────────────────────
+    changed: list[str] = []
+    for tier, new_hash in fingerprints.items():
+        old_entry = previous.get(tier, {})
+        old_hash  = old_entry.get("hash", "")
+        if old_hash and old_hash != new_hash:
+            changed.append(tier)
+            log.warning(
+                f"  [fingerprint] DOM CHANGED  tier='{tier}'  "
+                f"old={old_hash[:12]}…  new={new_hash[:12]}…  "
+                f"(last seen: {old_entry.get('updated', 'unknown')})"
+            )
+
+    if not changed:
+        log.info("  [fingerprint] DOM fingerprints unchanged ✓")
+    else:
+        log.warning(
+            f"  [fingerprint] {len(changed)} tier(s) changed: {changed}  "
+            "— review selectors.json if scraping starts failing"
+        )
+
+    # ── Write new fingerprints back to S3 ─────────────────────────────────────
+    new_data = {
+        tier: {"hash": h, "updated": today}
+        for tier, h in fingerprints.items()
+    }
+    try:
+        s3_client.put_object(
+            Bucket      = bucket,
+            Key         = key,
+            Body        = json.dumps(new_data, indent=2).encode("utf-8"),
+            ContentType = "application/json",
+        )
+        log.info(f"  [fingerprint] Saved fingerprints → s3://{bucket}/{key}")
+    except Exception as exc:
+        log.warning(f"  [fingerprint] Could not save fingerprints to S3: {exc}")

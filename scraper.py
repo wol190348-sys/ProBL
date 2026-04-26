@@ -20,6 +20,7 @@ Environment variables (set via GitHub Actions secrets):
   S3_BUCKET_NAME       (actual bucket name)
 """
 
+import difflib
 import os
 import re
 import json
@@ -105,6 +106,44 @@ def _get(url: str, **kwargs) -> requests.Response:
     raise RuntimeError(f"All retries exhausted for {url}")
 
 
+def _select_safe(soup, css: str, context: str = ""):
+    """
+    select_one wrapper: when nothing is found, logs a difflib hint showing the
+    closest live CSS class names — so you know what the selector likely changed to.
+    """
+    result = soup.select_one(css)
+    if result is None:
+        live_classes = sorted({c for el in soup.find_all(class_=True) for c in el.get("class", [])})
+        class_parts  = re.findall(r"\.(\w[\w-]*)", css)
+        id_parts     = re.findall(r"#(\w[\w-]*)",  css)
+        if class_parts or id_parts:
+            target      = class_parts[0] if class_parts else id_parts[0]
+            suggestions = difflib.get_close_matches(target, live_classes, n=3, cutoff=0.55)
+            hint = f" → closest live classes: {suggestions}" if suggestions else " → no close match on this page"
+            ctx  = f" ({context})" if context else ""
+            log.warning(f"  [selector] '{css}' returned nothing{ctx}{hint}")
+    return result
+
+
+def _select_safe_all(soup, css: str, context: str = "") -> list:
+    """
+    select wrapper: when the list is empty, logs a difflib hint showing the
+    closest live CSS class names — so you know what the selector likely changed to.
+    """
+    results = soup.select(css)
+    if not results:
+        live_classes = sorted({c for el in soup.find_all(class_=True) for c in el.get("class", [])})
+        class_parts  = re.findall(r"\.(\w[\w-]*)", css)
+        id_parts     = re.findall(r"#(\w[\w-]*)",  css)
+        if class_parts or id_parts:
+            target      = class_parts[0] if class_parts else id_parts[0]
+            suggestions = difflib.get_close_matches(target, live_classes, n=3, cutoff=0.55)
+            hint = f" → closest live classes: {suggestions}" if suggestions else " → no close match on this page"
+            ctx  = f" ({context})" if context else ""
+            log.warning(f"  [selector] '{css}' returned nothing{ctx}{hint}")
+    return results
+
+
 def _width_to_stars(style: str) -> float | None:
     """Convert CSS width% to a 1–5 star rating (20 % = 1 star)."""
     m = re.search(r"width\s*:\s*(\d+(?:\.\d+)?)%", style)
@@ -144,7 +183,7 @@ def fetch_all_shops() -> list[dict]:
     def _parse_shops(use_data_attr: bool) -> list[dict]:
         result = []
         # Exclude hidden shops (brand-a-z-hidden class) - these are shops from other categories
-        for el in soup.select(SEL["shop_list"]["shop_item"]):
+        for el in _select_safe_all(soup, SEL["shop_list"]["shop_item"], "shops listing page"):
             href     = el.get("href", "")
             name_div = el.select_one(SEL["shop_list"]["shop_name"])
             name     = (name_div.text.strip() if name_div else el.get("data-name", "")).strip()
@@ -303,7 +342,7 @@ def _collect_product_urls(shop_html: str, shop_slug: str) -> list[tuple[str, str
     # Extract the ACTUAL shop slug from the first product's shop link
     # This is more reliable than generating from data-name
     actual_slug = None
-    first_shop_link = soup.select_one(SEL["product_card"]["shop_link"])
+    first_shop_link = _select_safe(soup, SEL["product_card"]["shop_link"], "shop page")
     if first_shop_link:
         href = first_shop_link.get("href", "")
         # Extract: https://www.bleems.com/kw/shop/aromacake → aromacake
@@ -317,7 +356,7 @@ def _collect_product_urls(shop_html: str, shop_slug: str) -> list[tuple[str, str
         log.debug(f"    Using provided shop slug: '{shop_slug}'")
     
     # Get all product cards on the page
-    for card in soup.select(SEL["product_card"]["card"]):
+    for card in _select_safe_all(soup, SEL["product_card"]["card"], "shop page"):
         div = card.select_one(SEL["product_card"]["head"])
         if not div:
             continue
@@ -422,11 +461,11 @@ def fetch_shop_items(shop_html: str, shop: dict, s3: "boto3.client") -> list[dic
                     prod_soup = BeautifulSoup(resp.text, "html.parser")
                     
                     # Extract from product detail page HTML structure
-                    title_el = prod_soup.select_one(SEL["product_detail"]["title"])
-                    price_el = prod_soup.select_one(SEL["product_detail"]["price"])
+                    title_el  = _select_safe(prod_soup, SEL["product_detail"]["title"],       prod_url)
+                    price_el  = prod_soup.select_one(SEL["product_detail"]["price"])
                     shop_link = prod_soup.select_one(SEL["product_detail"]["shop_link"])
-                    desc_el = prod_soup.select_one(SEL["product_detail"]["description"])
-                    img_el = prod_soup.select_one(SEL["product_detail"]["image"])
+                    desc_el   = prod_soup.select_one(SEL["product_detail"]["description"])
+                    img_el    = prod_soup.select_one(SEL["product_detail"]["image"])
                     
                     if title_el:
                         # Build data dict from HTML
@@ -793,7 +832,7 @@ def fetch_shop_data(shop: dict, s3: "boto3.client") -> tuple[list[dict], list[di
     soup = BeautifulSoup(html, "html.parser")
 
     # ── Refresh overall rating from page ──────────────────────────────────────
-    rating_span = soup.select_one(SEL["shop_ratings"]["ratings_container"])
+    rating_span = _select_safe(soup, SEL["shop_ratings"]["ratings_container"], shop["name"])
     if rating_span:
         rating_on = rating_span.select_one(SEL["shop_ratings"]["rating_stars"])
         if rating_on:
@@ -944,9 +983,10 @@ def main():
         region_name           = AWS_REGION,
     )
 
-    # ── 0. Selector health check ──────────────────────────────────────────────
+    # ── 0. Selector health check + DOM fingerprint comparison ────────────────
     import selector_health as _health
-    _health.run_health_check(abort_on_failure=False)
+    _health_passed, _fingerprints = _health.run_health_check(abort_on_failure=False)
+    _health.compare_and_store_fingerprints(_fingerprints, s3, S3_BUCKET, S3_FOLDER)
 
     # ── 1. Fetch shop list ────────────────────────────────────────────────────
     all_shops = fetch_all_shops()
