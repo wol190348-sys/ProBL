@@ -109,8 +109,12 @@ def check(name: str, passed: bool, detail: str, severity: str = "critical") -> d
 
 def validate_columns(headers: list[str], required: list[str]) -> tuple[bool, str]:
     missing = [c for c in required if c not in headers]
+    extra = [c for c in headers if c not in required]
     if missing:
-        return False, f"Missing columns: {missing}"
+        detail = f"Missing columns: {missing}"
+        if extra:
+            detail += f" | Extra columns: {extra}"
+        return False, detail
     return True, "All required columns present"
 
 
@@ -208,11 +212,19 @@ def validate_file(
     checks.append(check("required_columns", ok, detail))
 
     lo, hi = file_spec.get("row_count_range", [0, 999999])
-    in_range = lo <= row_count <= hi
+    if row_count < lo:
+        row_detail = f"{row_count} rows — below minimum {lo} (expected {lo}–{hi})"
+        in_range = False
+    elif row_count > hi:
+        row_detail = f"{row_count} rows — above maximum {hi} (expected {lo}–{hi})"
+        in_range = False
+    else:
+        row_detail = f"{row_count} rows (expected {lo}–{hi})"
+        in_range = True
     checks.append(check(
         "row_count_range",
         in_range,
-        f"{row_count} rows (expected {lo}–{hi})",
+        row_detail,
         "high" if not in_range else "medium",
     ))
 
@@ -285,18 +297,111 @@ def upload_yaml(client: Any, bucket: str, key: str, payload: dict) -> None:
     )
 
 
+def severity_label(severity: str) -> str:
+    return {"critical": "CRITICAL", "high": "HIGH", "medium": "MEDIUM"}.get(severity, severity.upper())
+
+
+def collect_failures(report: dict) -> list[dict]:
+    failures: list[dict] = []
+    for scraper_result in report["scrapers"]:
+        scraper = scraper_result["scraper"]
+        for file_result in scraper_result.get("files", []):
+            for chk in file_result.get("checks", []):
+                if not chk["passed"]:
+                    failures.append({
+                        "scraper": scraper,
+                        "file": file_result.get("file", "?"),
+                        "key": file_result.get("key", ""),
+                        "date": file_result.get("date", ""),
+                        "row_count": file_result.get("row_count"),
+                        "size_kb": file_result.get("size_kb"),
+                        **chk,
+                    })
+    return failures
+
+
+def print_run_context(args: argparse.Namespace, bucket: str, dates: list[date]) -> None:
+    print(f"Bucket:         s3://{bucket}")
+    print(f"Target date:    {args.date}  (lookback {args.days_lookback} day(s))")
+    print(f"Dates checked:  {', '.join(d.isoformat() for d in dates)}")
+    print(f"Quality checks: {'on' if args.quality else 'off'}")
+    print(f"Update stats:   {'on' if args.update_stats else 'off'}")
+
+
+def print_scan_log(scraper: str, category: str, d: date, bucket: str, prefix: str, objects: dict) -> None:
+    print(f"\n--- {scraper} / {d.isoformat()} ---")
+    print(f"  R2 prefix: s3://{bucket}/{prefix}")
+    if objects:
+        for name in sorted(objects):
+            obj = objects[name]
+            size_kb = obj.get("Size", 0) / 1024
+            print(f"  Found:     {name} ({size_kb:.1f} KB)")
+    else:
+        print("  Found:     (no objects under prefix)")
+
+
+def print_failure_details(report: dict) -> None:
+    failures = collect_failures(report)
+    if not failures:
+        print("\nAll checks passed.")
+        return
+
+    print(f"\n{'=' * 70}")
+    print(f"FAILURES — {len(failures)} check(s) did not pass")
+    print("=" * 70)
+    for i, f in enumerate(failures, 1):
+        print(f"\n[{i}] [{severity_label(f['severity'])}] {f['scraper']} / {f['file']}")
+        if f.get("date"):
+            print(f"    Date:      {f['date']}")
+        if f.get("key"):
+            print(f"    R2 key:    {f['key']}")
+        if f.get("row_count") is not None:
+            print(f"    Rows:      {f['row_count']}")
+        if f.get("size_kb") is not None:
+            print(f"    Size:      {f['size_kb']} KB")
+        print(f"    Check:     {f['check']}")
+        print(f"    Reason:    {f['detail']}")
+
+
+def print_file_check_log(scraper: str, file_result: dict) -> None:
+    """Log per-file check outcomes when any check failed."""
+    failed = [c for c in file_result.get("checks", []) if not c["passed"]]
+    if not failed:
+        return
+    fname = file_result.get("file", "?")
+    print(f"  >> {scraper}/{fname}: {len(failed)} failed check(s)")
+    for c in failed:
+        print(f"     - [{severity_label(c['severity'])}] {c['check']}: {c['detail']}")
+
+
 def write_step_summary(report: dict) -> None:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
         return
-    lines = ["## R2 CSV Monitor\n", "| Scraper | Files | Passed | Total | Status |", "|---|---:|---:|---:|---|"]
+    lines = [
+        "## R2 CSV Monitor",
+        "",
+        "| Scraper | Files | Passed | Total | Status |",
+        "|---|---:|---:|---:|---|",
+    ]
     for s in report["scrapers"]:
         status = "✅" if s["all_passed"] else "❌"
         lines.append(
             f"| {s['scraper']} | {s['files_found']} | {s['checks_passed']} | {s['checks_total']} | {status} |"
         )
-    with open(summary_path, "a", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+
+    failures = collect_failures(report)
+    if failures:
+        lines.extend(["", "### Failures", ""])
+        for f in failures:
+            lines.append(
+                f"- **{f['scraper']} / {f['file']}** — `{f['check']}`: {f['detail']}"
+            )
+            if f.get("key"):
+                lines.append(f"  - R2 key: `{f['key']}`")
+
+    with open(summary_path, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
 
 
 def print_summary(report: dict) -> None:
@@ -321,6 +426,7 @@ def main() -> int:
     schema_list = config.get("csv_schema") or config.get("excel_schema") or []
     start = date.fromisoformat(args.date)
     dates = [start - timedelta(days=i) for i in range(args.days_lookback)]
+    print_run_context(args, bucket, dates)
 
     report: dict[str, Any] = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -341,31 +447,50 @@ def main() -> int:
             "all_passed": True,
         }
 
+        file_specs = schema.get("files") or schema.get("sheets") or []
+        expected = [f["name"] for f in file_specs if not f.get("optional")]
+        optional = [f["name"] for f in file_specs if f.get("optional")]
+        print(f"\n=== Scraper: {scraper_name} (folder: {category}) ===")
+        print(f"  Expected files: {expected or '(none)'}")
+        if optional:
+            print(f"  Optional files: {optional}")
+
         for d in dates:
             prefix = partition_prefix(category, d)
             objects = {os.path.basename(o["Key"]): o for o in list_objects(client, bucket, prefix)}
+            print_scan_log(scraper_name, category, d, bucket, prefix, objects)
 
-            for file_spec in schema.get("files") or schema.get("sheets") or []:
+            for file_spec in file_specs:
                 fname = file_spec["name"]
-                optional = file_spec.get("optional", False)
+                is_optional = file_spec.get("optional", False)
                 obj = objects.get(fname)
 
                 if obj is None:
-                    if optional:
+                    if is_optional:
+                        print(f"  -- {fname}: skipped (optional, not in R2)")
                         continue
-                    scraper_result["files"].append({
+                    file_result = {
                         "file": fname,
                         "key": f"{prefix}{fname}",
-                        "checks": [check("file_exists", False, "File not found in R2")],
+                        "date": d.isoformat(),
+                        "checks": [check(
+                            "file_exists",
+                            False,
+                            f"File not found — expected at s3://{bucket}/{prefix}{fname}",
+                        )],
                         "row_count": 0,
                         "columns": [],
-                    })
+                    }
+                    scraper_result["files"].append(file_result)
                     scraper_result["files_found"] += 1
+                    print_file_check_log(scraper_name, file_result)
                     continue
 
                 scraper_result["files_found"] += 1
                 file_result = validate_file(client, bucket, obj["Key"], file_spec, args.quality)
+                file_result["date"] = d.isoformat()
                 scraper_result["files"].append(file_result)
+                print_file_check_log(scraper_name, file_result)
 
         for fr in scraper_result["files"]:
             for c in fr["checks"]:
@@ -379,6 +504,7 @@ def main() -> int:
         report["scrapers"].append(scraper_result)
 
     print_summary(report)
+    print_failure_details(report)
     write_step_summary(report)
 
     report_key = f"{R2_PREFIX}/monitor/{start.isoformat()}/report.json"
