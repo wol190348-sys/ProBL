@@ -1,0 +1,121 @@
+name: R2 CSV Monitor
+
+on:
+  schedule:
+    - cron: "0 8 * * 1-6"   # Mon–Sat — daily validation
+    - cron: "0 9 * * 0"      # Sunday — weekly stats refresh
+
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Target date YYYY-MM-DD (default yesterday UTC)"
+        required: false
+        type: string
+      update_stats:
+        description: "Update monitor_stats.yml in R2"
+        required: false
+        type: boolean
+        default: false
+      days_lookback:
+        description: "Number of days to check"
+        required: false
+        type: string
+        default: "1"
+      quality_checks:
+        description: "Run deep data-quality checks"
+        required: false
+        type: boolean
+        default: false
+      fail_on_error:
+        description: "Exit 1 on any failed check"
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  daily-check:
+    name: Daily CSV Validation
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * 1-6'
+
+    env:
+      CF_R2_ACCESS_KEY_ID:     ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+      CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+      CF_R2_ENDPOINT_URL:      ${{ secrets.CF_R2_ENDPOINT_URL }}
+      CF_R2_BUCKET_NAME:       ${{ secrets.CF_R2_BUCKET_NAME }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install --upgrade --cache-dir ~/.cache/pip -r requirements.txt
+
+      - name: Build monitor flags
+        id: flags
+        run: |
+          FLAGS=""
+          if [ -n "${{ inputs.date }}" ]; then
+            FLAGS="$FLAGS --date ${{ inputs.date }}"
+          fi
+          if [ "${{ inputs.update_stats }}" = "true" ]; then
+            FLAGS="$FLAGS --update-stats"
+          fi
+          if [ -n "${{ inputs.days_lookback }}" ]; then
+            FLAGS="$FLAGS --days-lookback ${{ inputs.days_lookback }}"
+          fi
+          if [ "${{ inputs.quality_checks }}" = "true" ]; then
+            FLAGS="$FLAGS --quality"
+          fi
+          if [ "${{ inputs.fail_on_error }}" = "true" ]; then
+            FLAGS="$FLAGS --fail-on-error"
+          fi
+          echo "flags=$FLAGS" >> $GITHUB_OUTPUT
+
+      - name: Run R2 CSV monitor
+        run: python monitor/inspect_r2_schema.py ${{ steps.flags.outputs.flags }}
+
+  weekly-stats:
+    name: Weekly Stats Refresh
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 9 * * 0'
+
+    env:
+      CF_R2_ACCESS_KEY_ID:     ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+      CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+      CF_R2_ENDPOINT_URL:      ${{ secrets.CF_R2_ENDPOINT_URL }}
+      CF_R2_BUCKET_NAME:       ${{ secrets.CF_R2_BUCKET_NAME }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install --upgrade --cache-dir ~/.cache/pip -r requirements.txt
+
+      - name: Build monitor flags
+        id: flags
+        run: |
+          FLAGS="--days-lookback 7 --update-stats --quality"
+          if [ -n "${{ inputs.date }}" ]; then
+            FLAGS="$FLAGS --date ${{ inputs.date }}"
+          fi
+          if [ "${{ inputs.fail_on_error }}" = "true" ]; then
+            FLAGS="$FLAGS --fail-on-error"
+          fi
+          echo "flags=$FLAGS" >> $GITHUB_OUTPUT
+
+      - name: Run R2 CSV monitor (weekly)
+        run: python monitor/inspect_r2_schema.py ${{ steps.flags.outputs.flags }}
