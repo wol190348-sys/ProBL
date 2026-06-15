@@ -20,3 +20,14 @@ SCRAPING_EVOLUTION.md
 show_data_quality_comparison.py
 show_workflow_comparison.py
 __pycache__/selector_health.cpython-311.pyc
+websites-config.yml
+websites-config-prompt.md
+skill.md
+websites-config-template.yml
+monitor_stats.yml
+monitor/report_*.json
+CF/README.md
+monitor.md
+prompts/monitor-prompt.md
+prompts/excel-schema-prompt.md
+.github/workflows/monitor.yml
