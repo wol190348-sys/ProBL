@@ -23,6 +23,7 @@ from botocore.exceptions import ClientError
 
 R2_PREFIX = "bleems-data"
 CONFIG_R2_KEY = f"{R2_PREFIX}/monitor/websites-config.yml"
+STATS_R2_KEY = f"{R2_PREFIX}/monitor/monitor_stats.yml"
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,6 +119,148 @@ def validate_columns(headers: list[str], required: list[str]) -> tuple[bool, str
     return True, "All required columns present"
 
 
+def get_monitor_settings(config: dict) -> dict:
+    """Monitor tuning from websites-config.yml `monitor:` block."""
+    m = config.get("monitor") or {}
+    default_tol = float(m.get("stats_tolerance", m.get("row_count_tolerance", 0.20)))
+    return {
+        "row_count_tolerance": float(m.get("row_count_tolerance", default_tol)),
+        "file_size_tolerance": float(m.get("file_size_tolerance", default_tol)),
+        "min_observations_for_range": int(m.get("min_observations_for_range", 1)),
+    }
+
+
+def get_file_stats(stats: dict, scraper: str, file_name: str) -> dict | None:
+    return (
+        stats.get("scrapers", {})
+        .get(scraper, {})
+        .get("files", {})
+        .get(file_name)
+    )
+
+
+def _stats_margin(value: float, tolerance: float, *, as_int: bool) -> float:
+    margin = value * tolerance
+    margin = max(margin, 1 if as_int else 0.1)
+    return int(margin) if as_int else round(margin, 2)
+
+
+def resolve_stats_range(
+    file_spec: dict,
+    file_stats: dict | None,
+    monitor_settings: dict,
+    metric: str,
+    current_value: float | None = None,
+) -> dict:
+    """
+    Derive acceptable bounds from monitor_stats.yml for row_count or size_kb.
+
+    Applies to shops.csv, items.csv, and reviews.csv equally.
+    Cold start: enforce min floor only (min_row_count / min_file_size_kb).
+    With stats: [hist_min - margin, hist_max + margin] at configured tolerance.
+    When current_value is set (--update-stats), folds today's observation in first.
+    """
+    if metric == "row_count":
+        min_floor = int(file_spec.get("min_row_count", 0))
+        tol = monitor_settings["row_count_tolerance"]
+        as_int = True
+    elif metric == "size_kb":
+        min_floor = float(file_spec.get("min_file_size_kb", 0))
+        tol = monitor_settings["file_size_tolerance"]
+        as_int = False
+    else:
+        raise ValueError(f"Unknown metric: {metric}")
+
+    min_obs = monitor_settings["min_observations_for_range"]
+    obs = int((file_stats or {}).get("observation_count", 0))
+    hist_min = (file_stats or {}).get(f"{metric}_min")
+    hist_max = (file_stats or {}).get(f"{metric}_max")
+
+    if current_value is not None:
+        cur = int(current_value) if as_int else round(float(current_value), 2)
+        if hist_min is None:
+            hist_min = cur
+        else:
+            hist_min = min(int(hist_min) if as_int else float(hist_min), cur)
+        if hist_max is None:
+            hist_max = cur
+        else:
+            hist_max = max(int(hist_max) if as_int else float(hist_max), cur)
+        if obs == 0:
+            obs = 1
+
+    if obs >= min_obs and hist_min is not None and hist_max is not None:
+        hist_min = int(hist_min) if as_int else round(float(hist_min), 2)
+        hist_max = int(hist_max) if as_int else round(float(hist_max), 2)
+        margin_lo = _stats_margin(hist_min, tol, as_int=as_int)
+        margin_hi = _stats_margin(hist_max, tol, as_int=as_int)
+        lo = max(min_floor, hist_min - margin_lo) if as_int else max(min_floor, round(hist_min - margin_lo, 2))
+        hi = hist_max + margin_hi if as_int else round(hist_max + margin_hi, 2)
+        return {
+            "metric": metric,
+            "lo": lo,
+            "hi": hi,
+            "source": "stats",
+            "hist_min": hist_min,
+            "hist_max": hist_max,
+            "observation_count": obs,
+            "tolerance_pct": round(tol * 100, 1),
+        }
+
+    return {
+        "metric": metric,
+        "lo": min_floor if min_floor > 0 else None,
+        "hi": None,
+        "source": "min_only" if min_floor > 0 else "none",
+        "hist_min": None,
+        "hist_max": None,
+        "observation_count": obs,
+        "tolerance_pct": round(tol * 100, 1),
+    }
+
+
+def format_range_detail(value: float, bounds: dict, unit: str) -> tuple[bool, str]:
+    """Format pass/fail detail for row_count_range or file_size_range checks."""
+    lo, hi = bounds["lo"], bounds["hi"]
+    source = bounds["source"]
+    tol = bounds["tolerance_pct"]
+    as_int = bounds["metric"] == "row_count"
+    display = str(int(value)) if as_int else f"{value:.1f} {unit}"
+
+    if source == "stats":
+        hist_lo, hist_max = bounds["hist_min"], bounds["hist_max"]
+        obs = bounds["observation_count"]
+        lo_d = str(lo) if as_int else f"{lo:.1f}"
+        hi_d = str(hi) if as_int else f"{hi:.1f}"
+        hist_lo_d = str(hist_lo) if as_int else f"{hist_lo:.1f}"
+        hist_hi_d = str(hist_max) if as_int else f"{hist_max:.1f}"
+        if value < lo:
+            return False, (
+                f"{display} — below allowed minimum {lo_d} {unit} "
+                f"(stats: {hist_lo_d}–{hist_hi_d} {unit} over {obs} run(s), ±{tol}% tolerance)"
+            )
+        if value > hi:
+            return False, (
+                f"{display} — above allowed maximum {hi_d} {unit} "
+                f"(stats: {hist_lo_d}–{hist_hi_d} {unit} over {obs} run(s), ±{tol}% tolerance)"
+            )
+        return True, (
+            f"{display} within {lo_d}–{hi_d} {unit} "
+            f"(stats: {hist_lo_d}–{hist_hi_d} {unit} over {obs} run(s), ±{tol}% tolerance)"
+        )
+
+    if source == "min_only":
+        lo_d = str(lo) if as_int else f"{lo:.1f}"
+        if value >= lo:
+            return True, (
+                f"{display} (min {lo_d} {unit} required; "
+                f"upper bound pending — no historical stats yet)"
+            )
+        return False, f"{display} — below required minimum {lo_d} {unit}"
+
+    return True, f"{display} (no {unit} bounds — awaiting first --update-stats run)"
+
+
 def run_quality_checks(df: pd.DataFrame, file_name: str) -> list[dict]:
     results: list[dict] = []
     if file_name == "items.csv" and "product_id" in df.columns:
@@ -176,6 +319,9 @@ def validate_file(
     key: str,
     file_spec: dict,
     quality: bool,
+    file_stats: dict | None,
+    monitor_settings: dict,
+    calibrate_with_current: bool = False,
 ) -> dict:
     file_name = file_spec["name"]
     checks: list[dict] = []
@@ -190,13 +336,6 @@ def validate_file(
     checks.append(check("file_readable", True, "Downloaded OK"))
 
     size_kb = len(raw) / 1024
-    min_kb = file_spec.get("min_file_size_kb", 0)
-    checks.append(check(
-        "min_file_size_kb",
-        size_kb >= min_kb,
-        f"{size_kb:.1f} KB (min {min_kb} KB)",
-        "high" if size_kb < min_kb else "medium",
-    ))
 
     try:
         df = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig")
@@ -208,25 +347,54 @@ def validate_file(
     columns = list(df.columns)
     row_count = len(df)
 
+    calibrate = calibrate_with_current
+    row_bounds = resolve_stats_range(
+        file_spec, file_stats, monitor_settings, "row_count",
+        current_value=row_count if calibrate else None,
+    )
+    size_bounds = resolve_stats_range(
+        file_spec, file_stats, monitor_settings, "size_kb",
+        current_value=size_kb if calibrate else None,
+    )
+
     ok, detail = validate_columns(columns, file_spec.get("required_columns", []))
     checks.append(check("required_columns", ok, detail))
 
-    lo, hi = file_spec.get("row_count_range", [0, 999999])
-    if row_count < lo:
-        row_detail = f"{row_count} rows — below minimum {lo} (expected {lo}–{hi})"
-        in_range = False
-    elif row_count > hi:
-        row_detail = f"{row_count} rows — above maximum {hi} (expected {lo}–{hi})"
-        in_range = False
-    else:
-        row_detail = f"{row_count} rows (expected {lo}–{hi})"
-        in_range = True
+    in_range, row_detail = format_range_detail(row_count, row_bounds, "rows")
     checks.append(check(
         "row_count_range",
         in_range,
         row_detail,
         "high" if not in_range else "medium",
     ))
+
+    size_ok, size_detail = format_range_detail(size_kb, size_bounds, "KB")
+    checks.append(check(
+        "file_size_range",
+        size_ok,
+        size_detail,
+        "high" if not size_ok else "medium",
+    ))
+
+    min_row = int(file_spec.get("min_row_count", 0))
+    if min_row > 0:
+        min_ok = row_count >= min_row
+        checks.append(check(
+            "min_row_count",
+            min_ok,
+            f"{row_count} rows (minimum required: {min_row})",
+            "critical" if not min_ok else "medium",
+        ))
+
+    min_size = float(file_spec.get("min_file_size_kb", 0))
+    if min_size > 0:
+        min_size_ok = size_kb >= min_size
+        checks.append(check(
+            "min_file_size_kb",
+            min_size_ok,
+            f"{size_kb:.1f} KB (minimum required: {min_size} KB)",
+            "high" if not min_size_ok else "medium",
+        ))
 
     if quality:
         checks.extend(run_quality_checks(df, file_name))
@@ -238,12 +406,13 @@ def validate_file(
         "row_count": row_count,
         "columns": columns,
         "size_kb": round(size_kb, 2),
+        "row_bounds": row_bounds,
+        "size_bounds": size_bounds,
     }
 
 
 def load_existing_stats(client: Any, bucket: str) -> dict:
-    key = f"{R2_PREFIX}/monitor/monitor_stats.yml"
-    raw = download_bytes(client, bucket, key)
+    raw = download_bytes(client, bucket, STATS_R2_KEY)
     if not raw:
         return {}
     try:
@@ -260,19 +429,23 @@ def merge_stats(existing: dict, report: dict) -> dict:
         entry = stats["scrapers"].setdefault(name, {"files": {}})
         for file_result in scraper_result.get("files", []):
             fname = file_result["file"]
-            fstats = entry["files"].setdefault(fname, {
-                "row_count_min": file_result.get("row_count", 0),
-                "row_count_max": file_result.get("row_count", 0),
-                "size_kb_min": file_result.get("size_kb", 0),
-                "size_kb_max": file_result.get("size_kb", 0),
-                "columns_seen": [],
-            })
             rc = file_result.get("row_count", 0)
             sk = file_result.get("size_kb", 0)
+            fstats = entry["files"].setdefault(fname, {
+                "row_count_min": rc,
+                "row_count_max": rc,
+                "size_kb_min": sk,
+                "size_kb_max": sk,
+                "columns_seen": [],
+                "observation_count": 0,
+                "row_count_last": rc,
+            })
             fstats["row_count_min"] = min(fstats.get("row_count_min", rc), rc)
             fstats["row_count_max"] = max(fstats.get("row_count_max", rc), rc)
             fstats["size_kb_min"] = min(fstats.get("size_kb_min", sk), sk)
             fstats["size_kb_max"] = max(fstats.get("size_kb_max", sk), sk)
+            fstats["row_count_last"] = rc
+            fstats["observation_count"] = fstats.get("observation_count", 0) + 1
             union = set(fstats.get("columns_seen", [])) | set(file_result.get("columns", []))
             fstats["columns_seen"] = sorted(union)
     stats["last_updated"] = datetime.now(timezone.utc).isoformat()
@@ -320,12 +493,48 @@ def collect_failures(report: dict) -> list[dict]:
     return failures
 
 
-def print_run_context(args: argparse.Namespace, bucket: str, dates: list[date]) -> None:
+def print_bounds_log(fname: str, row_bounds: dict, size_bounds: dict) -> None:
+    """Log stats-derived row and file-size bounds for any CSV (shops, items, reviews)."""
+    for label, bounds, unit in (
+        ("Rows", row_bounds, "rows"),
+        ("Size", size_bounds, "KB"),
+    ):
+        src = bounds["source"]
+        if src == "stats":
+            lo = bounds["lo"]
+            hi = bounds["hi"]
+            hmin = bounds["hist_min"]
+            hmax = bounds["hist_max"]
+            if bounds["metric"] == "size_kb":
+                print(
+                    f"  {label} bounds {fname}: {lo:.1f}–{hi:.1f} {unit} "
+                    f"(stats {hmin:.1f}–{hmax:.1f} {unit}, "
+                    f"±{bounds['tolerance_pct']}%, {bounds['observation_count']} run(s))"
+                )
+            else:
+                print(
+                    f"  {label} bounds {fname}: {lo}–{hi} {unit} "
+                    f"(stats {hmin}–{hmax} {unit}, "
+                    f"±{bounds['tolerance_pct']}%, {bounds['observation_count']} run(s))"
+                )
+        elif src == "min_only":
+            lo = bounds["lo"]
+            lo_d = f"{lo:.1f}" if bounds["metric"] == "size_kb" else str(lo)
+            print(f"  {label} bounds {fname}: min {lo_d} {unit} (no stats yet — upper bound open)")
+        else:
+            print(f"  {label} bounds {fname}: open (awaiting first --update-stats run)")
+
+
+def print_run_context(args: argparse.Namespace, bucket: str, dates: list[date], stats: dict) -> None:
     print(f"Bucket:         s3://{bucket}")
     print(f"Target date:    {args.date}  (lookback {args.days_lookback} day(s))")
     print(f"Dates checked:  {', '.join(d.isoformat() for d in dates)}")
     print(f"Quality checks: {'on' if args.quality else 'off'}")
     print(f"Update stats:   {'on' if args.update_stats else 'off'}")
+    if stats.get("last_updated"):
+        print(f"Stats loaded:   {stats['last_updated']} ({len(stats.get('scrapers', {}))} scraper(s))")
+    else:
+        print("Stats loaded:   (none yet — bounds use min_row_count only until first --update-stats)")
 
 
 def print_scan_log(scraper: str, category: str, d: date, bucket: str, prefix: str, objects: dict) -> None:
@@ -424,9 +633,16 @@ def main() -> int:
     print(f"Config loaded from {'local file' if args.config_local else f's3://{bucket}/{CONFIG_R2_KEY}'}")
 
     schema_list = config.get("csv_schema") or config.get("excel_schema") or []
+    monitor_settings = get_monitor_settings(config)
+    stats = load_existing_stats(client, bucket)
     start = date.fromisoformat(args.date)
     dates = [start - timedelta(days=i) for i in range(args.days_lookback)]
-    print_run_context(args, bucket, dates)
+    print_run_context(args, bucket, dates, stats)
+    print(
+        f"Stats tolerance: ±{monitor_settings['row_count_tolerance'] * 100:.0f}% rows, "
+        f"±{monitor_settings['file_size_tolerance'] * 100:.0f}% file size "
+        f"(from monitor_stats.yml — applies to shops.csv, items.csv, reviews.csv)"
+    )
 
     report: dict[str, Any] = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -486,8 +702,17 @@ def main() -> int:
                     print_file_check_log(scraper_name, file_result)
                     continue
 
+                file_stats = get_file_stats(stats, scraper_name, fname)
+                row_preview = resolve_stats_range(file_spec, file_stats, monitor_settings, "row_count")
+                size_preview = resolve_stats_range(file_spec, file_stats, monitor_settings, "size_kb")
+                print_bounds_log(fname, row_preview, size_preview)
+
                 scraper_result["files_found"] += 1
-                file_result = validate_file(client, bucket, obj["Key"], file_spec, args.quality)
+                file_result = validate_file(
+                    client, bucket, obj["Key"], file_spec, args.quality,
+                    file_stats, monitor_settings,
+                    calibrate_with_current=args.update_stats,
+                )
                 file_result["date"] = d.isoformat()
                 scraper_result["files"].append(file_result)
                 print_file_check_log(scraper_name, file_result)
@@ -514,9 +739,8 @@ def main() -> int:
     if args.update_stats:
         existing = load_existing_stats(client, bucket)
         merged = merge_stats(existing, report)
-        stats_key = f"{R2_PREFIX}/monitor/monitor_stats.yml"
-        upload_yaml(client, bucket, stats_key, merged)
-        print(f"Stats updated at s3://{bucket}/{stats_key}")
+        upload_yaml(client, bucket, STATS_R2_KEY, merged)
+        print(f"Stats updated at s3://{bucket}/{STATS_R2_KEY}")
 
     if args.fail_on_error and any_failed:
         return 1
