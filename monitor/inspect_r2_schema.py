@@ -21,6 +21,8 @@ import pandas as pd
 import yaml
 from botocore.exceptions import ClientError
 
+from ads_counter import count_scraper_ads
+
 R2_PREFIX = "bleems-data"
 CONFIG_R2_KEY = f"{R2_PREFIX}/monitor/websites-config.yml"
 STATS_R2_KEY = f"{R2_PREFIX}/monitor/monitor_stats.yml"
@@ -590,14 +592,20 @@ def write_step_summary(report: dict) -> None:
     lines = [
         "## R2 CSV Monitor",
         "",
-        "| Scraper | Files | Passed | Total | Status |",
-        "|---|---:|---:|---:|---|",
+        "| Scraper | Files | Passed | Total | Unique Ads | Source | Status |",
+        "|---|---:|---:|---:|---:|---|---|",
     ]
     for s in report["scrapers"]:
         status = "✅" if s["all_passed"] else "❌"
+        unique_ads = s.get("unique_ads", "—")
+        ads_source = s.get("ads_source", "—")
         lines.append(
-            f"| {s['scraper']} | {s['files_found']} | {s['checks_passed']} | {s['checks_total']} | {status} |"
+            f"| {s['scraper']} | {s['files_found']} | {s['checks_passed']} | {s['checks_total']} "
+            f"| {unique_ads} | {ads_source} | {status} |"
         )
+    total = report.get("total_unique_ads")
+    if total is not None:
+        lines.extend(["", f"**Total unique ads:** {total}"])
 
     failures = collect_failures(report)
     if failures:
@@ -614,14 +622,20 @@ def write_step_summary(report: dict) -> None:
 
 
 def print_summary(report: dict) -> None:
-    print(f"\n{'Scraper':<16} {'Files':>5} {'Pass':>6} {'Total':>6}  Status")
-    print("-" * 50)
+    print(f"\n{'Scraper':<16} {'Files':>5} {'Pass':>6} {'Total':>6}  {'Unique Ads':>10}  {'Source':<12}  Status")
+    print("-" * 72)
     for s in report["scrapers"]:
         status = "OK" if s["all_passed"] else "FAIL"
+        unique_ads = s.get("unique_ads", "—")
+        ads_source = s.get("ads_source", "—")
         print(
             f"{s['scraper']:<16} {s['files_found']:>5} "
-            f"{s['checks_passed']:>6} {s['checks_total']:>6}  {status}"
+            f"{s['checks_passed']:>6} {s['checks_total']:>6}  "
+            f"{str(unique_ads):>10}  {ads_source:<12}  {status}"
         )
+    total = report.get("total_unique_ads")
+    if total is not None:
+        print(f"\n  Total unique ads (all scrapers): {total}")
 
 
 def main() -> int:
@@ -726,7 +740,21 @@ def main() -> int:
                     scraper_result["all_passed"] = False
                     any_failed = True
 
+        scraper_prefixes = [partition_prefix(category, d) for d in dates]
+        ads_stats = count_scraper_ads(client, bucket, scraper_prefixes)
+        scraper_result["unique_ads"] = ads_stats.get("unique_ads") or 0
+        scraper_result["total_rows"] = ads_stats.get("total_rows") or 0
+        scraper_result["ads_source"] = ads_stats.get("ads_source", "none")
+        print(
+            f"  Ads: {scraper_result['unique_ads']} unique "
+            f"({scraper_result['ads_source']}, {scraper_result['total_rows']} total rows)"
+        )
+
         report["scrapers"].append(scraper_result)
+
+    report["total_unique_ads"] = sum(
+        r.get("unique_ads") or 0 for r in report["scrapers"]
+    )
 
     print_summary(report)
     print_failure_details(report)

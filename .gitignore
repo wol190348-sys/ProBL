@@ -28,5 +28,5 @@ monitor_stats.yml
 monitor/report_*.json
 CF/README.md
 monitor.md
-prompts/monitor-prompt.md
-prompts/excel-schema-prompt.md
+prompts/*
+monitor/site.yml
