@@ -30,8 +30,8 @@ STATS_R2_KEY = f"{R2_PREFIX}/monitor/monitor_stats.yml"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate R2 CSV outputs against csv_schema")
-    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
-    parser.add_argument("--date", default=yesterday.isoformat(), help="Target date YYYY-MM-DD (UTC)")
+    today = datetime.now(timezone.utc).date()
+    parser.add_argument("--date", default=today.isoformat(), help="Target date YYYY-MM-DD (UTC)")
     parser.add_argument("--days-lookback", type=int, default=1, help="Number of days to check")
     parser.add_argument("--update-stats", action="store_true", help="Merge observations into monitor_stats.yml in R2")
     parser.add_argument("--quality", action="store_true", help="Run deep data-quality checks")

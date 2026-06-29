@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       date:
-        description: "Target date YYYY-MM-DD (default yesterday UTC)"
+        description: "Target date YYYY-MM-DD (default today UTC)"
         required: false
         type: string
       update_stats:
