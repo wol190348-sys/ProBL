@@ -23,6 +23,7 @@ import yaml
 from botocore.exceptions import ClientError
 
 from ads_counter import count_scraper_ads
+<<<<<<< HEAD
 from github_workflows import build_scraper_run_meta, load_site_run_meta
 from r2_file_counter import count_scraper_r2_files, count_site_r2_files
 from request_metrics import (
@@ -30,6 +31,9 @@ from request_metrics import (
     build_run_error_summary,
     count_scraper_request_metrics,
 )
+=======
+from r2_file_counter import count_scraper_r2_files, count_site_r2_files
+>>>>>>> 083ff8c016144aecfb86e753c229a53e648c6916
 
 R2_PREFIX = "bleems-data"
 CONFIG_R2_KEY = f"{R2_PREFIX}/monitor/websites-config.yml"
@@ -876,10 +880,13 @@ def main() -> int:
             f"({scraper_result['ads_source']}, {scraper_result['total_rows']} total rows)"
         )
 
+<<<<<<< HEAD
         _apply_request_metrics(
             scraper_result, client, bucket, schema, site_r2_prefix, start
         )
 
+=======
+>>>>>>> 083ff8c016144aecfb86e753c229a53e648c6916
         if scraper_uses_date_first_layout(schema):
             scraper_result["r2_file_count"] = date_first_r2_counts.get(category, 0)
             print(f"  R2 inventory: {scraper_result['r2_file_count']} object(s) ({category})")
@@ -897,10 +904,13 @@ def main() -> int:
         r.get("unique_ads") or 0 for r in report["scrapers"]
     )
 
+<<<<<<< HEAD
     site_metrics = aggregate_site_request_metrics(report["scrapers"])
     report.update(site_metrics)
     report["error_summary"] = build_run_error_summary(report["scrapers"])
 
+=======
+>>>>>>> 083ff8c016144aecfb86e753c229a53e648c6916
     if site_r2_prefix:
         print(f"\nCounting site R2 inventory under s3://{bucket}/{site_r2_prefix}/ ...")
         report["total_r2_files"] = count_site_r2_files(
@@ -912,6 +922,7 @@ def main() -> int:
             r.get("r2_file_count") or 0 for r in report["scrapers"]
         )
 
+<<<<<<< HEAD
     site_meta = load_site_run_meta()
     partition = start.isoformat()
     report["github_run"] = build_scraper_run_meta(
@@ -922,6 +933,8 @@ def main() -> int:
     )
     report["run_place"] = report["github_run"].get("run_place")
 
+=======
+>>>>>>> 083ff8c016144aecfb86e753c229a53e648c6916
     print_summary(report)
     print_failure_details(report)
     write_step_summary(report)
