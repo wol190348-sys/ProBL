@@ -95,6 +95,76 @@ SESSION.headers.update(HEADERS)
 REQUEST_DELAY = 1.5
 
 
+class RequestMetrics:
+    """Track HTTP throughput and failures for one category scrape run."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.requests_total = 0
+        self.requests_failed = 0
+        self.failed_items: list[dict] = []
+        self._failed_by_key: dict[str, dict] = {}
+
+    def record_request(self, *, failed: bool = False) -> None:
+        self.requests_total += 1
+        if failed:
+            self.requests_failed += 1
+
+    def record_shop_failure(self, name: str, slug: str = "", detail: str = "") -> None:
+        key = slug or name
+        if key in self._failed_by_key:
+            self._failed_by_key[key]["errors"] += 1
+            if detail:
+                self._failed_by_key[key]["detail"] = detail
+            return
+        entry: dict = {"name": name, "errors": 1, "detail": detail}
+        if slug:
+            entry["slug"] = slug
+        self._failed_by_key[key] = entry
+        self.failed_items.append(entry)
+
+    def build_summary(self, total_listings: int, duration_sec: float) -> dict:
+        requests_per_min = (
+            round(self.requests_total / (duration_sec / 60), 2) if duration_sec > 0 else 0
+        )
+        return {
+            "scraped_at": datetime.now(timezone.utc).isoformat(),
+            "saved_to_s3_date": TODAY,
+            "total_listings": total_listings,
+            "request_metrics": {
+                "requests_total": self.requests_total,
+                "requests_failed": self.requests_failed,
+                "requests_per_min": requests_per_min,
+                "duration_sec": round(duration_sec),
+                "failed_items": self.failed_items,
+            },
+        }
+
+
+_CATEGORY_METRICS = RequestMetrics()
+
+
+def _record_http_response(resp: requests.Response) -> None:
+    failed = resp.status_code >= 400
+    _CATEGORY_METRICS.record_request(failed=failed)
+
+
+def _record_http_failure() -> None:
+    _CATEGORY_METRICS.record_request(failed=True)
+
+
+def _session_get(session: requests.Session, url: str, **kwargs) -> requests.Response:
+    try:
+        resp = session.get(url, **kwargs)
+        _record_http_response(resp)
+        return resp
+    except requests.RequestException:
+        _record_http_failure()
+        raise
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -102,7 +172,7 @@ def _get(url: str, **kwargs) -> requests.Response:
     """GET with retry (up to 3 times)."""
     for attempt in range(1, 4):
         try:
-            resp = SESSION.get(url, timeout=30, **kwargs)
+            resp = _session_get(SESSION, url, timeout=30, **kwargs)
             resp.encoding = 'utf-8'
             resp.raise_for_status()
             return resp
@@ -413,7 +483,7 @@ def fetch_shop_items(shop_html: str, shop: dict, s3: "boto3.client") -> list[dic
         time.sleep(REQUEST_DELAY)
         data = None
         try:
-            resp = SESSION.get(prod_url, timeout=30)
+            resp = _session_get(SESSION, prod_url, timeout=30)
             resp.encoding = 'utf-8'
             if resp.status_code == 200:
                 data = _extract_track_json(resp.text)
@@ -646,7 +716,7 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
     rev_session.headers.update(HEADERS)
 
     try:
-        fresh_resp = rev_session.get(shop_url, timeout=30)
+        fresh_resp = _session_get(rev_session, shop_url, timeout=30)
         fresh_resp.encoding = 'utf-8'
         fresh_html = fresh_resp.text
     except requests.RequestException as exc:
@@ -679,8 +749,12 @@ def fetch_reviews_for_shop(shop_slug: str, shop: dict, page_html: str) -> list[d
         if page_no == 1:
             log.info(f"    GET {REVIEWS_URL}?shopLink={shop_slug}&pageNo=1&pageSize=20")
         try:
-            resp = rev_session.get(
-                REVIEWS_URL, params=params, headers=get_headers, timeout=30
+            resp = _session_get(
+                rev_session,
+                REVIEWS_URL,
+                params=params,
+                headers=get_headers,
+                timeout=30,
             )
             if not resp.ok:
                 log.warning(
@@ -802,7 +876,7 @@ def upload_image_to_r2(image_url: str, r2_path: str, s3: "boto3.client") -> str:
         return ""
 
     try:
-        resp = SESSION.get(image_url, timeout=30, stream=True)
+        resp = _session_get(SESSION, image_url, timeout=30, stream=True)
         resp.raise_for_status()
 
         content_type = resp.headers.get('Content-Type', 'image/jpeg')
@@ -832,6 +906,21 @@ def upload_df_to_r2(df: "pd.DataFrame", s3: "boto3.client", key: str):
             ContentType = "text/csv; charset=utf-8",
         )
         log.info(f"✓  r2://{S3_BUCKET}/{key}  ({len(df)} rows)")
+    except ClientError as exc:
+        log.error(f"R2 upload failed for {key}: {exc}")
+        raise
+
+
+def upload_json_to_r2(s3: "boto3.client", key: str, payload: dict) -> None:
+    """Upload a JSON summary document to Cloudflare R2."""
+    try:
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=key,
+            Body=json.dumps(payload, indent=2, default=str).encode("utf-8"),
+            ContentType="application/json",
+        )
+        log.info(f"✓  r2://{S3_BUCKET}/{key}")
     except ClientError as exc:
         log.error(f"R2 upload failed for {key}: {exc}")
         raise
@@ -921,6 +1010,9 @@ def main():
         log.info(f"Processing type: {shop_type}  ({len(shops)} shops)")
         log.info(f"{'─'*60}")
 
+        _CATEGORY_METRICS.reset()
+        category_started_at = time.time()
+
         all_items:   list[dict] = []
         all_reviews: list[dict] = []
         enriched:    list[dict] = []
@@ -934,7 +1026,19 @@ def main():
                 enriched.append(shop)
                 continue
 
-            items, reviews, updated_shop = fetch_shop_data(shop, r2)
+            try:
+                items, reviews, updated_shop = fetch_shop_data(shop, r2)
+            except Exception as exc:
+                log.error(f"    Shop scrape failed: {exc}")
+                _CATEGORY_METRICS.record_shop_failure(
+                    shop["name"],
+                    shop.get("slug", ""),
+                    str(exc),
+                )
+                shop["r2_image_path"] = ""
+                enriched.append(shop)
+                continue
+
             all_items.extend(items)
             all_reviews.extend(reviews)
             enriched.append(updated_shop)
@@ -979,10 +1083,19 @@ def main():
         else:
             log.warning(f"  No reviews found for {shop_type}")
 
+        summary_key = f"{prefix}/json-files/summary_{_now.strftime('%Y%m%d')}.json"
+        summary_payload = _CATEGORY_METRICS.build_summary(
+            len(all_items),
+            time.time() - category_started_at,
+        )
+        upload_json_to_r2(r2, summary_key, summary_payload)
+
         log.info(
             f"  Done {shop_type}: {len(enriched)} shops, {len(all_items)} items, "
             f"{len(all_reviews)} reviews | Images: {shops_with_images} shop logos, "
-            f"{items_with_images} product images"
+            f"{items_with_images} product images | "
+            f"HTTP: {_CATEGORY_METRICS.requests_total} requests, "
+            f"{_CATEGORY_METRICS.requests_failed} failed"
         )
 
     log.info("\nAll done!")
