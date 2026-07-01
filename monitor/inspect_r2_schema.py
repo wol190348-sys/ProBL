@@ -12,6 +12,7 @@ import argparse
 import io
 import json
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -22,6 +23,13 @@ import yaml
 from botocore.exceptions import ClientError
 
 from ads_counter import count_scraper_ads
+from github_workflows import build_scraper_run_meta, load_site_run_meta
+from r2_file_counter import count_scraper_r2_files, count_site_r2_files
+from request_metrics import (
+    aggregate_site_request_metrics,
+    build_run_error_summary,
+    count_scraper_request_metrics,
+)
 
 R2_PREFIX = "bleems-data"
 CONFIG_R2_KEY = f"{R2_PREFIX}/monitor/websites-config.yml"
@@ -87,6 +95,63 @@ def date_parts(d: date) -> tuple[str, str, str]:
 def partition_prefix(category_folder: str, d: date) -> str:
     year, month, day = date_parts(d)
     return f"{R2_PREFIX}/year={year}/month={month}/day={day}/{category_folder}/"
+
+
+def get_site_r2_prefix(config: dict) -> str:
+    return (
+        config.get("r2_prefix")
+        or config.get("meta", {}).get("r2_prefix")
+        or R2_PREFIX
+    ).strip("/")
+
+
+def resolve_scraper_r2_base(schema: dict, site_r2_prefix: str) -> str:
+    raw = (schema.get("r2_path") or schema.get("r2_base") or "").replace("{bucket}/", "")
+    if raw.strip("/"):
+        return raw.strip("/")
+    scraper = schema["scraper"]
+    return f"{site_r2_prefix}/{schema.get('category_folder', scraper)}"
+
+
+def _date_first_category_pattern(site_r2_prefix: str, category: str) -> re.Pattern[str]:
+    prefix = re.escape(site_r2_prefix.strip("/"))
+    category = re.escape(category.strip("/"))
+    return re.compile(rf"^{prefix}/year=\d+/month=\d+/day=\d+/{category}/")
+
+
+def _normalize_r2_prefix(prefix: str) -> str:
+    prefix = prefix.strip("/")
+    return f"{prefix}/" if prefix else ""
+
+
+def count_date_first_scrapers_r2_files(
+    client: Any,
+    bucket: str,
+    site_r2_prefix: str,
+    categories: list[str],
+) -> dict[str, int]:
+    """Single R2 listing pass for all date-first categories."""
+    prefix = _normalize_r2_prefix(site_r2_prefix)
+    patterns = {
+        category: _date_first_category_pattern(site_r2_prefix, category)
+        for category in categories
+    }
+    counts = {category: 0 for category in categories}
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith("/"):
+                continue
+            for category, pattern in patterns.items():
+                if pattern.match(key):
+                    counts[category] += 1
+                    break
+    return counts
+
+
+def scraper_uses_date_first_layout(schema: dict) -> bool:
+    return not (schema.get("r2_path") or schema.get("r2_base"))
 
 
 def list_objects(client: Any, bucket: str, prefix: str) -> list[dict]:
@@ -592,20 +657,24 @@ def write_step_summary(report: dict) -> None:
     lines = [
         "## R2 CSV Monitor",
         "",
-        "| Scraper | Files | Passed | Total | Unique Ads | Source | Status |",
-        "|---|---:|---:|---:|---:|---|---|",
+        "| Scraper | Files | R2 Files | Passed | Total | Unique Ads | Source | Status |",
+        "|---|---:|---:|---:|---:|---:|---|---|",
     ]
     for s in report["scrapers"]:
         status = "✅" if s["all_passed"] else "❌"
         unique_ads = s.get("unique_ads", "—")
         ads_source = s.get("ads_source", "—")
+        r2_files = s.get("r2_file_count", "—")
         lines.append(
-            f"| {s['scraper']} | {s['files_found']} | {s['checks_passed']} | {s['checks_total']} "
+            f"| {s['scraper']} | {s['files_found']} | {r2_files} | {s['checks_passed']} | {s['checks_total']} "
             f"| {unique_ads} | {ads_source} | {status} |"
         )
     total = report.get("total_unique_ads")
+    total_r2 = report.get("total_r2_files")
     if total is not None:
         lines.extend(["", f"**Total unique ads:** {total}"])
+    if total_r2 is not None:
+        lines.append(f"**Total R2 files:** {total_r2}")
 
     failures = collect_failures(report)
     if failures:
@@ -621,25 +690,67 @@ def write_step_summary(report: dict) -> None:
         fh.write("\n".join(lines) + "\n")
 
 
+def _apply_request_metrics(
+    scraper_result: dict[str, Any],
+    client: Any,
+    bucket: str,
+    schema: dict,
+    site_r2_prefix: str,
+    partition_dt: date,
+) -> None:
+    r2_base = resolve_scraper_r2_base(schema, site_r2_prefix)
+    req_stats = count_scraper_request_metrics(
+        client,
+        bucket,
+        r2_base,
+        partition_dt,
+        date_first=scraper_uses_date_first_layout(schema),
+    )
+    scraper_result["requests_total"] = req_stats.get("requests_total")
+    scraper_result["requests_failed"] = req_stats.get("requests_failed")
+    scraper_result["error_rate_pct"] = req_stats.get("error_rate_pct")
+    scraper_result["requests_per_min"] = req_stats.get("requests_per_min")
+    scraper_result["duration_sec"] = req_stats.get("duration_sec")
+    scraper_result["metrics_source"] = req_stats.get("metrics_source", "none")
+    if req_stats.get("failed_items_summary"):
+        scraper_result["failed_items_summary"] = req_stats["failed_items_summary"]
+
+    if req_stats.get("metrics_source") != "none":
+        print(
+            f"  Request metrics: {req_stats.get('requests_total', 0)} total, "
+            f"{req_stats.get('requests_failed', 0)} failed, "
+            f"{req_stats.get('requests_per_min', 0)} req/min "
+            f"({req_stats.get('metrics_source')})"
+        )
+
+
 def print_summary(report: dict) -> None:
-    print(f"\n{'Scraper':<16} {'Files':>5} {'Pass':>6} {'Total':>6}  {'Unique Ads':>10}  {'Source':<12}  Status")
-    print("-" * 72)
+    print(
+        f"\n{'Scraper':<16} {'Files':>5} {'R2 Files':>9} {'Pass':>6} {'Total':>6}  "
+        f"{'Unique Ads':>10}  {'Source':<12}  Status"
+    )
+    print("-" * 84)
     for s in report["scrapers"]:
         status = "OK" if s["all_passed"] else "FAIL"
         unique_ads = s.get("unique_ads", "—")
         ads_source = s.get("ads_source", "—")
+        r2_files = s.get("r2_file_count", "—")
         print(
-            f"{s['scraper']:<16} {s['files_found']:>5} "
+            f"{s['scraper']:<16} {s['files_found']:>5} {str(r2_files):>9} "
             f"{s['checks_passed']:>6} {s['checks_total']:>6}  "
             f"{str(unique_ads):>10}  {ads_source:<12}  {status}"
         )
     total = report.get("total_unique_ads")
     if total is not None:
         print(f"\n  Total unique ads (all scrapers): {total}")
+    total_r2 = report.get("total_r2_files")
+    if total_r2 is not None:
+        print(f"  Total R2 files (site):           {total_r2}")
 
 
 def main() -> int:
     args = parse_args()
+    run_started_at = datetime.now(timezone.utc)
     client = build_r2_client()
     bucket = resolve_bucket()
     config = load_config(client, bucket, local_path=args.config_local)
@@ -664,6 +775,21 @@ def main() -> int:
         "scrapers": [],
     }
     any_failed = False
+    site_r2_prefix = get_site_r2_prefix(config)
+    date_first_categories = [
+        schema.get("category_folder", schema["scraper"])
+        for schema in schema_list
+        if scraper_uses_date_first_layout(schema)
+    ]
+    date_first_r2_counts: dict[str, int] = {}
+    if date_first_categories:
+        print(
+            f"\nCounting R2 inventory (date-first layout) under s3://{bucket}/{site_r2_prefix}/ "
+            f"for {len(date_first_categories)} categor{'y' if len(date_first_categories) == 1 else 'ies'}..."
+        )
+        date_first_r2_counts = count_date_first_scrapers_r2_files(
+            client, bucket, site_r2_prefix, date_first_categories
+        )
 
     for schema in schema_list:
         scraper_name = schema["scraper"]
@@ -750,11 +876,51 @@ def main() -> int:
             f"({scraper_result['ads_source']}, {scraper_result['total_rows']} total rows)"
         )
 
+        _apply_request_metrics(
+            scraper_result, client, bucket, schema, site_r2_prefix, start
+        )
+
+        if scraper_uses_date_first_layout(schema):
+            scraper_result["r2_file_count"] = date_first_r2_counts.get(category, 0)
+            print(f"  R2 inventory: {scraper_result['r2_file_count']} object(s) ({category})")
+        else:
+            r2_base = resolve_scraper_r2_base(schema, site_r2_prefix)
+            print(f"  R2 inventory: counting objects under s3://{bucket}/{r2_base}/ ...")
+            scraper_result["r2_file_count"] = count_scraper_r2_files(
+                client, bucket, r2_base
+            )
+            print(f"  R2 inventory: {scraper_result['r2_file_count']} object(s)")
+
         report["scrapers"].append(scraper_result)
 
     report["total_unique_ads"] = sum(
         r.get("unique_ads") or 0 for r in report["scrapers"]
     )
+
+    site_metrics = aggregate_site_request_metrics(report["scrapers"])
+    report.update(site_metrics)
+    report["error_summary"] = build_run_error_summary(report["scrapers"])
+
+    if site_r2_prefix:
+        print(f"\nCounting site R2 inventory under s3://{bucket}/{site_r2_prefix}/ ...")
+        report["total_r2_files"] = count_site_r2_files(
+            client, bucket, site_r2_prefix
+        )
+        print(f"Site R2 inventory: {report['total_r2_files']} object(s)")
+    else:
+        report["total_r2_files"] = sum(
+            r.get("r2_file_count") or 0 for r in report["scrapers"]
+        )
+
+    site_meta = load_site_run_meta()
+    partition = start.isoformat()
+    report["github_run"] = build_scraper_run_meta(
+        site_meta,
+        partition,
+        run_started_at.replace(tzinfo=None),
+        not any_failed,
+    )
+    report["run_place"] = report["github_run"].get("run_place")
 
     print_summary(report)
     print_failure_details(report)

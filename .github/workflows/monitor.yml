@@ -1,5 +1,9 @@
 name: R2 CSV Monitor
 
+permissions:
+  contents: read
+  actions: read
+
 on:
   schedule:
     - cron: "0 8 * * 1-6"   # Mon–Sat — daily validation
