@@ -912,12 +912,18 @@ def main() -> int:
 
     site_meta = config.get("meta") or config
     partition = start.isoformat()
-    report["github_run"] = build_scraper_run_meta(
+    github_run = build_scraper_run_meta(
         site_meta,
         partition,
         run_started_at.replace(tzinfo=None),
         not any_failed,
     )
+    github_gmail = (site_meta.get("github_gmail") or site_meta.get("github_email") or "").strip()
+    if github_gmail:
+        github_run["github_gmail"] = github_gmail
+    report["github_run"] = github_run
+    if github_gmail:
+        report["github_gmail"] = github_gmail
     report["run_place"] = report["github_run"].get("run_place")
     print_summary(report)
     print_failure_details(report)

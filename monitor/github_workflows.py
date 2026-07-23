@@ -144,6 +144,7 @@ def merge_registry_site(site: Dict, registry: Optional[Dict]) -> Dict:
         "schedule",
         "workflows",
         "workflow_name",
+        "github_gmail",
     ):
         if merged.get(key) in (None, "", []):
             val = reg_row.get(key)
@@ -353,6 +354,9 @@ def build_scraper_run_meta(
     if pipeline:
         result = dict(pipeline)
         result["monitor_run"] = monitor_meta
+        github_gmail = (site.get("github_gmail") or site.get("github_email") or "").strip()
+        if github_gmail:
+            result["github_gmail"] = github_gmail
         return result
 
     configured = resolve_workflow_names(site)
@@ -363,7 +367,7 @@ def build_scraper_run_meta(
             fallback_name = str(legacy)
 
     run_place = (site.get("run_place") or "github").strip().lower()
-    return {
+    result = {
         "run_place": run_place,
         "workflow_name": fallback_name or "—",
         "workflow_status": None,
@@ -371,3 +375,7 @@ def build_scraper_run_meta(
         "monitor_run": monitor_meta,
         "source": "registry_fallback",
     }
+    github_gmail = (site.get("github_gmail") or site.get("github_email") or "").strip()
+    if github_gmail:
+        result["github_gmail"] = github_gmail
+    return result
