@@ -911,8 +911,8 @@ def upload_df_to_r2(df: "pd.DataFrame", s3: "boto3.client", key: str):
         raise
 
 
-def upload_json_to_r2(s3: "boto3.client", key: str, payload: dict) -> None:
-    """Upload a JSON summary document to Cloudflare R2."""
+def upload_json_to_r2(s3: "boto3.client", key: str, payload: object) -> None:
+    """Upload a JSON document to Cloudflare R2."""
     try:
         s3.put_object(
             Bucket=S3_BUCKET,
@@ -1072,16 +1072,19 @@ def main():
         items_with_images = sum(1 for i in all_items  if i.get("r2_image_path"))
 
         upload_df_to_r2(pd.DataFrame(enriched), r2, f"{prefix}/shops.csv")
+        upload_json_to_r2(r2, f"{prefix}/json version/shops.json", enriched)
 
         if all_items:
             upload_df_to_r2(pd.DataFrame(all_items), r2, f"{prefix}/items.csv")
         else:
             log.warning(f"  No items found for {shop_type}")
+        upload_json_to_r2(r2, f"{prefix}/json version/items.json", all_items)
 
         if all_reviews:
             upload_df_to_r2(pd.DataFrame(all_reviews), r2, f"{prefix}/reviews.csv")
         else:
             log.warning(f"  No reviews found for {shop_type}")
+        upload_json_to_r2(r2, f"{prefix}/json version/reviews.json", all_reviews)
 
         summary_key = f"{prefix}/json-files/summary_{_now.strftime('%Y%m%d')}.json"
         summary_payload = _CATEGORY_METRICS.build_summary(
