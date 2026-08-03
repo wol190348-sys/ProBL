@@ -24,7 +24,7 @@ from botocore.exceptions import ClientError
 
 from ads_counter import count_scraper_ads
 from github_workflows import build_scraper_run_meta
-from r2_file_counter import count_scraper_r2_files, count_site_r2_files
+from r2_file_counter import get_scraper_r2_inventory, get_site_r2_inventory
 from request_metrics import (
     aggregate_site_request_metrics,
     build_run_error_summary,
@@ -124,28 +124,33 @@ def _normalize_r2_prefix(prefix: str) -> str:
     return f"{prefix}/" if prefix else ""
 
 
-def count_date_first_scrapers_r2_files(
+def count_date_first_scrapers_r2_inventory(
     client: Any,
     bucket: str,
     site_r2_prefix: str,
     categories: list[str],
-) -> dict[str, int]:
+) -> dict[str, dict[str, int]]:
     """Single R2 listing pass for all date-first categories."""
     prefix = _normalize_r2_prefix(site_r2_prefix)
     patterns = {
         category: _date_first_category_pattern(site_r2_prefix, category)
         for category in categories
     }
-    counts = {category: 0 for category in categories}
+    counts = {
+        category: {"file_count": 0, "total_size_bytes": 0}
+        for category in categories
+    }
     paginator = client.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
             if key.endswith("/"):
                 continue
+            obj_size = int(obj.get("Size", 0) or 0)
             for category, pattern in patterns.items():
                 if pattern.match(key):
-                    counts[category] += 1
+                    counts[category]["file_count"] += 1
+                    counts[category]["total_size_bytes"] += obj_size
                     break
     return counts
 
@@ -650,6 +655,17 @@ def print_file_check_log(scraper: str, file_result: dict) -> None:
         print(f"     - [{severity_label(c['severity'])}] {c['check']}: {c['detail']}")
 
 
+def format_bytes(size_bytes: int | None) -> str:
+    if size_bytes is None:
+        return "—"
+    size = float(size_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024.0
+    return f"{size_bytes} B"
+
+
 def write_step_summary(report: dict) -> None:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
@@ -657,24 +673,28 @@ def write_step_summary(report: dict) -> None:
     lines = [
         "## R2 CSV Monitor",
         "",
-        "| Scraper | Files | R2 Files | Passed | Total | Unique Ads | Source | Status |",
-        "|---|---:|---:|---:|---:|---:|---|---|",
+        "| Scraper | Files | R2 Files | R2 Size | Passed | Total | Unique Ads | Source | Status |",
+        "|---|---:|---:|---:|---:|---:|---:|---|---|",
     ]
     for s in report["scrapers"]:
         status = "✅" if s["all_passed"] else "❌"
         unique_ads = s.get("unique_ads", "—")
         ads_source = s.get("ads_source", "—")
         r2_files = s.get("r2_file_count", "—")
+        r2_size = format_bytes(s.get("r2_size_bytes"))
         lines.append(
-            f"| {s['scraper']} | {s['files_found']} | {r2_files} | {s['checks_passed']} | {s['checks_total']} "
+            f"| {s['scraper']} | {s['files_found']} | {r2_files} | {r2_size} | {s['checks_passed']} | {s['checks_total']} "
             f"| {unique_ads} | {ads_source} | {status} |"
         )
     total = report.get("total_unique_ads")
     total_r2 = report.get("total_r2_files")
+    total_r2_size = report.get("total_r2_size_bytes")
     if total is not None:
         lines.extend(["", f"**Total unique ads:** {total}"])
     if total_r2 is not None:
         lines.append(f"**Total R2 files:** {total_r2}")
+    if total_r2_size is not None:
+        lines.append(f"**Total R2 size:** {format_bytes(total_r2_size)}")
 
     failures = collect_failures(report)
     if failures:
@@ -726,18 +746,19 @@ def _apply_request_metrics(
 
 def print_summary(report: dict) -> None:
     print(
-        f"\n{'Scraper':<16} {'Files':>5} {'R2 Files':>9} {'Pass':>6} {'Total':>6}  "
+        f"\n{'Scraper':<16} {'Files':>5} {'R2 Files':>9} {'R2 Size':>10} {'Pass':>6} {'Total':>6}  "
         f"{'Unique Ads':>10}  {'Source':<12}  Status"
     )
-    print("-" * 84)
+    print("-" * 96)
     for s in report["scrapers"]:
         status = "OK" if s["all_passed"] else "FAIL"
         unique_ads = s.get("unique_ads", "—")
         ads_source = s.get("ads_source", "—")
         r2_files = s.get("r2_file_count", "—")
+        r2_size = format_bytes(s.get("r2_size_bytes"))
         print(
             f"{s['scraper']:<16} {s['files_found']:>5} {str(r2_files):>9} "
-            f"{s['checks_passed']:>6} {s['checks_total']:>6}  "
+            f"{r2_size:>10} {s['checks_passed']:>6} {s['checks_total']:>6}  "
             f"{str(unique_ads):>10}  {ads_source:<12}  {status}"
         )
     total = report.get("total_unique_ads")
@@ -746,6 +767,9 @@ def print_summary(report: dict) -> None:
     total_r2 = report.get("total_r2_files")
     if total_r2 is not None:
         print(f"  Total R2 files (site):           {total_r2}")
+    total_r2_size = report.get("total_r2_size_bytes")
+    if total_r2_size is not None:
+        print(f"  Total R2 size (site):            {format_bytes(total_r2_size)}")
 
 
 def main() -> int:
@@ -781,13 +805,13 @@ def main() -> int:
         for schema in schema_list
         if scraper_uses_date_first_layout(schema)
     ]
-    date_first_r2_counts: dict[str, int] = {}
+    date_first_r2_counts: dict[str, dict[str, int]] = {}
     if date_first_categories:
         print(
             f"\nCounting R2 inventory (date-first layout) under s3://{bucket}/{site_r2_prefix}/ "
             f"for {len(date_first_categories)} categor{'y' if len(date_first_categories) == 1 else 'ies'}..."
         )
-        date_first_r2_counts = count_date_first_scrapers_r2_files(
+        date_first_r2_counts = count_date_first_scrapers_r2_inventory(
             client, bucket, site_r2_prefix, date_first_categories
         )
 
@@ -880,15 +904,26 @@ def main() -> int:
             scraper_result, client, bucket, schema, site_r2_prefix, start
         )
         if scraper_uses_date_first_layout(schema):
-            scraper_result["r2_file_count"] = date_first_r2_counts.get(category, 0)
-            print(f"  R2 inventory: {scraper_result['r2_file_count']} object(s) ({category})")
+            inventory = date_first_r2_counts.get(
+                category,
+                {"file_count": 0, "total_size_bytes": 0},
+            )
+            scraper_result["r2_file_count"] = inventory["file_count"]
+            scraper_result["r2_size_bytes"] = inventory["total_size_bytes"]
+            print(
+                f"  R2 inventory: {scraper_result['r2_file_count']} object(s), "
+                f"{format_bytes(scraper_result['r2_size_bytes'])} ({category})"
+            )
         else:
             r2_base = resolve_scraper_r2_base(schema, site_r2_prefix)
             print(f"  R2 inventory: counting objects under s3://{bucket}/{r2_base}/ ...")
-            scraper_result["r2_file_count"] = count_scraper_r2_files(
-                client, bucket, r2_base
+            inventory = get_scraper_r2_inventory(client, bucket, r2_base)
+            scraper_result["r2_file_count"] = inventory["file_count"]
+            scraper_result["r2_size_bytes"] = inventory["total_size_bytes"]
+            print(
+                f"  R2 inventory: {scraper_result['r2_file_count']} object(s), "
+                f"{format_bytes(scraper_result['r2_size_bytes'])}"
             )
-            print(f"  R2 inventory: {scraper_result['r2_file_count']} object(s)")
 
         report["scrapers"].append(scraper_result)
 
@@ -901,13 +936,19 @@ def main() -> int:
     report["error_summary"] = build_run_error_summary(report["scrapers"])
     if site_r2_prefix:
         print(f"\nCounting site R2 inventory under s3://{bucket}/{site_r2_prefix}/ ...")
-        report["total_r2_files"] = count_site_r2_files(
-            client, bucket, site_r2_prefix
+        site_inventory = get_site_r2_inventory(client, bucket, site_r2_prefix)
+        report["total_r2_files"] = site_inventory["file_count"]
+        report["total_r2_size_bytes"] = site_inventory["total_size_bytes"]
+        print(
+            f"Site R2 inventory: {report['total_r2_files']} object(s), "
+            f"{format_bytes(report['total_r2_size_bytes'])}"
         )
-        print(f"Site R2 inventory: {report['total_r2_files']} object(s)")
     else:
         report["total_r2_files"] = sum(
             r.get("r2_file_count") or 0 for r in report["scrapers"]
+        )
+        report["total_r2_size_bytes"] = sum(
+            r.get("r2_size_bytes") or 0 for r in report["scrapers"]
         )
 
     site_meta = config.get("meta") or config
