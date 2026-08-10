@@ -6,6 +6,7 @@ Public API:
     count_site_r2_files(client, bucket, r2_prefix) -> int
     get_scraper_r2_inventory(client, bucket, r2_base) -> dict
     get_site_r2_inventory(client, bucket, r2_prefix) -> dict
+    get_partition_r2_inventory(client, bucket, partition_prefix) -> dict
 
 Shared with the Pro1-Os monitor hub — do not add site-specific logic here.
 """
@@ -67,3 +68,8 @@ def get_scraper_r2_inventory(client: Any, bucket: str, r2_base: str) -> dict[str
 def get_site_r2_inventory(client: Any, bucket: str, r2_prefix: str) -> dict[str, int]:
     """Get object count and total size for a site R2 prefix."""
     return _inventory_dict(client, bucket, r2_prefix)
+
+
+def get_partition_r2_inventory(client: Any, bucket: str, partition_prefix: str) -> dict[str, int]:
+    """Get object count and total size for a single date partition prefix."""
+    return _inventory_dict(client, bucket, partition_prefix)
