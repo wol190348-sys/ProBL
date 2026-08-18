@@ -24,7 +24,11 @@ from botocore.exceptions import ClientError
 
 from ads_counter import count_scraper_ads
 from github_workflows import build_scraper_run_meta
-from r2_file_counter import get_scraper_r2_inventory, get_site_r2_inventory
+from r2_file_counter import (
+    count_daily_r2_inventory_by_type,
+    count_scraper_r2_inventory_by_type,
+    count_site_r2_inventory_by_type,
+)
 from request_metrics import (
     aggregate_site_request_metrics,
     build_run_error_summary,
@@ -34,6 +38,7 @@ from request_metrics import (
 R2_PREFIX = "bleems-data"
 CONFIG_R2_KEY = f"{R2_PREFIX}/monitor/websites-config.yml"
 STATS_R2_KEY = f"{R2_PREFIX}/monitor/monitor_stats.yml"
+R2_TYPE_CATEGORIES = ("images", "json", "excel", "csv", "parquet", "other")
 
 
 def parse_args() -> argparse.Namespace:
@@ -124,6 +129,59 @@ def _normalize_r2_prefix(prefix: str) -> str:
     return f"{prefix}/" if prefix else ""
 
 
+def _file_type_for_key(key: str) -> str:
+    ext = os.path.splitext(key.lower())[1]
+    if ext in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".svg"}:
+        return "images"
+    if ext == ".json":
+        return "json"
+    if ext in {".xlsx", ".xls", ".xlsm"}:
+        return "excel"
+    if ext == ".csv":
+        return "csv"
+    if ext == ".parquet":
+        return "parquet"
+    return "other"
+
+
+def _empty_date_first_inventory() -> dict[str, int]:
+    return {
+        "file_count": 0,
+        "total_size_bytes": 0,
+        **{f"{cat}_bytes": 0 for cat in R2_TYPE_CATEGORIES},
+    }
+
+
+def _apply_type_inventory_to_scraper(
+    scraper_result: dict[str, Any],
+    inventory: dict[str, Any],
+    *,
+    daily: bool = False,
+) -> None:
+    if daily:
+        scraper_result["r2_daily_size"] = inventory.get("size_bytes") or 0
+        for cat in R2_TYPE_CATEGORIES:
+            scraper_result[f"r2_daily_{cat}_bytes"] = (
+                inventory.get("by_type_bytes", {}).get(cat) or 0
+            )
+        return
+
+    scraper_result["r2_file_count"] = inventory.get("objects") or 0
+    scraper_result["r2_size_bytes"] = inventory.get("size_bytes") or 0
+    for cat in R2_TYPE_CATEGORIES:
+        scraper_result[f"r2_{cat}_bytes"] = inventory.get("by_type_bytes", {}).get(cat) or 0
+
+
+def _apply_date_first_inventory_to_scraper(
+    scraper_result: dict[str, Any],
+    inventory: dict[str, int],
+) -> None:
+    scraper_result["r2_file_count"] = inventory.get("file_count") or 0
+    scraper_result["r2_size_bytes"] = inventory.get("total_size_bytes") or 0
+    for cat in R2_TYPE_CATEGORIES:
+        scraper_result[f"r2_{cat}_bytes"] = inventory.get(f"{cat}_bytes") or 0
+
+
 def count_date_first_scrapers_r2_inventory(
     client: Any,
     bucket: str,
@@ -136,10 +194,7 @@ def count_date_first_scrapers_r2_inventory(
         category: _date_first_category_pattern(site_r2_prefix, category)
         for category in categories
     }
-    counts = {
-        category: {"file_count": 0, "total_size_bytes": 0}
-        for category in categories
-    }
+    counts = {category: _empty_date_first_inventory() for category in categories}
     paginator = client.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
@@ -151,6 +206,8 @@ def count_date_first_scrapers_r2_inventory(
                 if pattern.match(key):
                     counts[category]["file_count"] += 1
                     counts[category]["total_size_bytes"] += obj_size
+                    file_type = _file_type_for_key(key)
+                    counts[category][f"{file_type}_bytes"] += obj_size
                     break
     return counts
 
@@ -834,6 +891,8 @@ def main() -> int:
             "checks_total": 0,
             "all_passed": True,
             "r2_daily_size": 0,
+            **{f"r2_{cat}_bytes": 0 for cat in R2_TYPE_CATEGORIES},
+            **{f"r2_daily_{cat}_bytes": 0 for cat in R2_TYPE_CATEGORIES},
         }
 
         file_specs = schema.get("files") or schema.get("sheets") or []
@@ -849,10 +908,15 @@ def main() -> int:
             object_list = list_objects(client, bucket, prefix)
             objects = {os.path.basename(o["Key"]): o for o in object_list}
             if d == start:
-                scraper_result["r2_daily_size"] = sum(
-                    int(o.get("Size", 0) or 0)
-                    for o in object_list
-                    if not o["Key"].endswith("/")
+                if scraper_uses_date_first_layout(schema):
+                    daily_r2_base = resolve_scraper_r2_base(schema, site_r2_prefix)
+                else:
+                    daily_r2_base = partition_prefix(category, d).strip("/")
+                daily_inventory = count_daily_r2_inventory_by_type(
+                    client, bucket, daily_r2_base, d
+                )
+                _apply_type_inventory_to_scraper(
+                    scraper_result, daily_inventory, daily=True
                 )
             print_scan_log(scraper_name, category, d, bucket, prefix, objects)
 
@@ -920,12 +984,8 @@ def main() -> int:
             scraper_result, client, bucket, schema, site_r2_prefix, start
         )
         if scraper_uses_date_first_layout(schema):
-            inventory = date_first_r2_counts.get(
-                category,
-                {"file_count": 0, "total_size_bytes": 0},
-            )
-            scraper_result["r2_file_count"] = inventory["file_count"]
-            scraper_result["r2_size_bytes"] = inventory["total_size_bytes"]
+            inventory = date_first_r2_counts.get(category, _empty_date_first_inventory())
+            _apply_date_first_inventory_to_scraper(scraper_result, inventory)
             print(
                 f"  R2 inventory: {scraper_result['r2_file_count']} object(s), "
                 f"{format_bytes(scraper_result['r2_size_bytes'])} ({category})"
@@ -937,9 +997,8 @@ def main() -> int:
         else:
             r2_base = resolve_scraper_r2_base(schema, site_r2_prefix)
             print(f"  R2 inventory: counting objects under s3://{bucket}/{r2_base}/ ...")
-            inventory = get_scraper_r2_inventory(client, bucket, r2_base)
-            scraper_result["r2_file_count"] = inventory["file_count"]
-            scraper_result["r2_size_bytes"] = inventory["total_size_bytes"]
+            inventory = count_scraper_r2_inventory_by_type(client, bucket, r2_base)
+            _apply_type_inventory_to_scraper(scraper_result, inventory)
             print(
                 f"  R2 inventory: {scraper_result['r2_file_count']} object(s), "
                 f"{format_bytes(scraper_result['r2_size_bytes'])}"
@@ -961,11 +1020,20 @@ def main() -> int:
     report["total_r2_daily_size"] = sum(
         r.get("r2_daily_size") or 0 for r in report["scrapers"]
     )
+    for cat in R2_TYPE_CATEGORIES:
+        report[f"total_r2_daily_{cat}_bytes"] = sum(
+            r.get(f"r2_daily_{cat}_bytes") or 0 for r in report["scrapers"]
+        )
+
     if site_r2_prefix:
         print(f"\nCounting site R2 inventory under s3://{bucket}/{site_r2_prefix}/ ...")
-        site_inventory = get_site_r2_inventory(client, bucket, site_r2_prefix)
-        report["total_r2_files"] = site_inventory["file_count"]
-        report["total_r2_size_bytes"] = site_inventory["total_size_bytes"]
+        site_inventory = count_site_r2_inventory_by_type(client, bucket, site_r2_prefix)
+        report["total_r2_files"] = site_inventory.get("objects") or 0
+        report["total_r2_size_bytes"] = site_inventory.get("size_bytes") or 0
+        for cat in R2_TYPE_CATEGORIES:
+            report[f"total_r2_{cat}_bytes"] = (
+                site_inventory.get("by_type_bytes", {}).get(cat) or 0
+            )
         print(
             f"Site R2 inventory: {report['total_r2_files']} object(s), "
             f"{format_bytes(report['total_r2_size_bytes'])}"
@@ -981,6 +1049,10 @@ def main() -> int:
         report["total_r2_size_bytes"] = sum(
             r.get("r2_size_bytes") or 0 for r in report["scrapers"]
         )
+        for cat in R2_TYPE_CATEGORIES:
+            report[f"total_r2_{cat}_bytes"] = sum(
+                r.get(f"r2_{cat}_bytes") or 0 for r in report["scrapers"]
+            )
 
     site_meta = config.get("meta") or config
     partition = start.isoformat()
