@@ -153,6 +153,26 @@ def merge_registry_site(site: Dict, registry: Optional[Dict]) -> Dict:
     return merged
 
 
+def enrich_site_from_env(site: Dict) -> Dict:
+    """Fill github_username/repo from GITHUB_REPOSITORY when meta omits them."""
+    merged = dict(site)
+    owner = (merged.get("github_username") or merged.get("github_owner") or "").strip()
+    repo = (merged.get("repo") or "").strip()
+    if owner and repo:
+        return merged
+
+    gh_repo = (os.environ.get("GITHUB_REPOSITORY") or "").strip()
+    if "/" not in gh_repo:
+        return merged
+
+    env_owner, env_repo = gh_repo.split("/", 1)
+    if not owner:
+        merged["github_username"] = env_owner
+    if not repo:
+        merged["repo"] = env_repo
+    return merged
+
+
 def _lookback_start(partition_date: str, schedule: Optional[str]) -> datetime:
     sched = (schedule or "daily").lower().replace(" ", "_").replace("-", "_")
     days = _SCHEDULE_LOOKBACK_DAYS.get(sched, 2)
@@ -227,6 +247,49 @@ def _latest_run_for_workflow(
     return None
 
 
+def _discover_latest_scraper_run(
+    owner: str,
+    repo: str,
+    token: str,
+    not_before: datetime,
+) -> Optional[Dict]:
+    """
+    When site meta has no workflows list, pick the newest completed non-monitor
+    workflow run in the lookback window.
+    """
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/actions/runs"
+        f"?per_page=30&exclude_pull_requests=true"
+    )
+    data = _github_request(url, token)
+    for run in data.get("workflow_runs", []):
+        name = run.get("name") or run.get("display_title") or ""
+        if is_monitor_workflow(str(name)):
+            continue
+        if run.get("status") != "completed":
+            continue
+        started = _parse_github_dt(run.get("run_started_at"))
+        if started and started >= not_before:
+            return run
+    return None
+
+
+def _run_detail_from_api(run: Dict, owner: str, repo: str, wf_name: str) -> Dict[str, Any]:
+    return {
+        "name": wf_name,
+        "owner": owner,
+        "repo": repo,
+        "run_id": run.get("id"),
+        "run_number": run.get("run_number"),
+        "conclusion": run.get("conclusion"),
+        "status": run.get("status"),
+        "duration_sec": _run_duration_sec(run),
+        "run_started_at": run.get("run_started_at"),
+        "updated_at": run.get("updated_at"),
+        "html_url": run.get("html_url"),
+    }
+
+
 def _pipeline_status(conclusions: List[Optional[str]]) -> str:
     if not conclusions:
         return "unknown"
@@ -244,9 +307,8 @@ def fetch_pipeline_github_meta(
     token: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Fetch latest GitHub Actions runs for configured scraper workflows."""
+    site = enrich_site_from_env(site)
     entries = parse_workflow_entries(site)
-    if not entries:
-        return None
 
     token = (token or os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
     if not token:
@@ -254,20 +316,51 @@ def fetch_pipeline_github_meta(
         return None
 
     not_before = _lookback_start(partition_date, site.get("schedule"))
+    owner = (site.get("github_username") or site.get("github_owner") or "").strip()
+    repo = (site.get("repo") or "").strip()
+
+    # No workflows declared — discover newest non-monitor completed run.
+    if not entries:
+        if not owner or not repo:
+            log.info("Skipping GitHub workflow lookup — no owner/repo and no workflows configured")
+            return None
+        try:
+            run = _discover_latest_scraper_run(owner, repo, token, not_before)
+        except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as exc:
+            log.warning(f"GitHub run discovery failed for {owner}/{repo}: {exc}")
+            return None
+        if not run:
+            log.info(
+                f"No recent non-monitor run for {owner}/{repo} since {not_before.isoformat()}"
+            )
+            return None
+        wf_name = str(run.get("name") or "scraper")
+        detail = _run_detail_from_api(run, owner, repo, wf_name)
+        return {
+            "run_place": "github",
+            "workflow_name": wf_name,
+            "workflow_status": _pipeline_status([detail.get("conclusion")]),
+            "duration_sec": detail.get("duration_sec") or 0,
+            "workflow_run_id": str(detail["run_id"]) if detail.get("run_id") else None,
+            "workflow_run_number": detail.get("run_number"),
+            "github_repository": f"{owner}/{repo}",
+            "workflows": [detail],
+            "source": "github_api_discovered",
+        }
 
     # Cache workflow id maps per repo
     id_cache: Dict[str, Dict[str, int]] = {}
     runs_detail: List[Dict[str, Any]] = []
 
     for entry in entries:
-        owner = entry["owner"]
-        repo = entry["repo"]
+        entry_owner = entry["owner"]
+        entry_repo = entry["repo"]
         wf_name = entry["name"]
-        cache_key = f"{owner}/{repo}"
+        cache_key = f"{entry_owner}/{entry_repo}"
 
         if cache_key not in id_cache:
             try:
-                id_cache[cache_key] = _workflow_name_map(owner, repo, token)
+                id_cache[cache_key] = _workflow_name_map(entry_owner, entry_repo, token)
             except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as exc:
                 log.warning(f"GitHub workflow list failed for {cache_key}: {exc}")
                 id_cache[cache_key] = {}
@@ -277,26 +370,14 @@ def fetch_pipeline_github_meta(
             log.warning(f"Workflow not found in {cache_key}: {wf_name!r}")
             continue
         try:
-            run = _latest_run_for_workflow(owner, repo, wf_id, token, not_before)
+            run = _latest_run_for_workflow(entry_owner, entry_repo, wf_id, token, not_before)
         except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError) as exc:
             log.warning(f"GitHub run lookup failed for {cache_key} / {wf_name}: {exc}")
             continue
         if not run:
             log.info(f"No recent run for {cache_key} / {wf_name} since {not_before.isoformat()}")
             continue
-        runs_detail.append({
-            "name": wf_name,
-            "owner": owner,
-            "repo": repo,
-            "run_id": run.get("id"),
-            "run_number": run.get("run_number"),
-            "conclusion": run.get("conclusion"),
-            "status": run.get("status"),
-            "duration_sec": _run_duration_sec(run),
-            "run_started_at": run.get("run_started_at"),
-            "updated_at": run.get("updated_at"),
-            "html_url": run.get("html_url"),
-        })
+        runs_detail.append(_run_detail_from_api(run, entry_owner, entry_repo, wf_name))
 
     if not runs_detail:
         return None
@@ -327,6 +408,7 @@ def build_scraper_run_meta(
     partition_date: str,
     monitor_started_at: datetime,
     validation_passed: bool,
+    fallback_duration_sec: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Build github_run metadata for report.json / dashboard.
@@ -334,13 +416,15 @@ def build_scraper_run_meta(
     Prefers scraper pipeline runs from GitHub API; never labels the monitor workflow
     as the site's primary workflow.
     """
+    site = enrich_site_from_env(site)
     pipeline = fetch_pipeline_github_meta(site, partition_date)
 
+    monitor_duration = max(0, int((datetime.utcnow() - monitor_started_at).total_seconds()))
     monitor_meta: Dict[str, Any] = {
         "run_place": (site.get("run_place") or "github").strip().lower(),
         "workflow_name": os.environ.get("GITHUB_WORKFLOW", "Schema Monitor"),
         "workflow_status": "success" if validation_passed else "failure",
-        "duration_sec": max(0, int((datetime.utcnow() - monitor_started_at).total_seconds())),
+        "duration_sec": monitor_duration,
         "started_at": monitor_started_at.isoformat() + "Z",
         "finished_at": datetime.utcnow().isoformat() + "Z",
     }
@@ -366,12 +450,20 @@ def build_scraper_run_meta(
         if legacy and not is_monitor_workflow(str(legacy)):
             fallback_name = str(legacy)
 
+    if fallback_duration_sec is not None and fallback_duration_sec > 0:
+        duration_sec = int(fallback_duration_sec)
+        duration_source = "request_metrics"
+    else:
+        duration_sec = monitor_duration
+        duration_source = "monitor_run"
+
     run_place = (site.get("run_place") or "github").strip().lower()
     result = {
         "run_place": run_place,
         "workflow_name": fallback_name or "—",
         "workflow_status": None,
-        "duration_sec": None,
+        "duration_sec": duration_sec,
+        "duration_source": duration_source,
         "monitor_run": monitor_meta,
         "source": "registry_fallback",
     }

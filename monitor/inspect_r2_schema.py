@@ -989,6 +989,7 @@ def main() -> int:
         partition,
         run_started_at.replace(tzinfo=None),
         not any_failed,
+        fallback_duration_sec=site_metrics.get("duration_sec"),
     )
     github_gmail = (site_meta.get("github_gmail") or site_meta.get("github_email") or "").strip()
     if github_gmail:

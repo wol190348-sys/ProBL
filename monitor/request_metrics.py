@@ -255,6 +255,8 @@ def aggregate_site_request_metrics(all_results: list[dict]) -> dict:
         site["error_rate_pct"] = error_rate_pct
     if requests_per_min is not None:
         site["requests_per_min"] = requests_per_min
+    if has_duration:
+        site["duration_sec"] = total_duration
     return site
 
 
