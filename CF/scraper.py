@@ -19,6 +19,7 @@ Environment variables (set via GitHub Actions secrets):
   CF_R2_SECRET_ACCESS_KEY  Cloudflare R2 secret key
   CF_R2_ENDPOINT_URL       https://<account-id>.r2.cloudflarestorage.com
   CF_R2_BUCKET_NAME        R2 bucket name
+  UPLOAD_IMAGES            Set to "1" to download product/shop images and upload to R2 (default: off)
 """
 
 import difflib
@@ -93,6 +94,9 @@ SESSION.headers.update(HEADERS)
 
 # Polite delay between requests (seconds)
 REQUEST_DELAY = 1.5
+
+# Set UPLOAD_IMAGES=1 to download shop logos and product images to R2
+UPLOAD_IMAGES = os.environ.get("UPLOAD_IMAGES", "0") == "1"
 
 
 class RequestMetrics:
@@ -871,7 +875,11 @@ def upload_image_to_r2(image_url: str, r2_path: str, s3: "boto3.client") -> str:
     """
     Download an image from a URL and upload it to Cloudflare R2.
     Returns the R2 path on success, empty string on failure.
+    Skipped entirely when UPLOAD_IMAGES is not enabled.
     """
+    if not UPLOAD_IMAGES:
+        return ""
+
     if not image_url or not r2_path:
         return ""
 
@@ -948,6 +956,7 @@ def main():
     log.info(f"Run date   : {TODAY}")
     log.info(f"R2 bucket  : {S3_BUCKET}")
     log.info(f"R2 endpoint: {CF_R2_ENDPOINT_URL}")
+    log.info(f"Image upload: {'enabled' if UPLOAD_IMAGES else 'disabled'}")
     if args.category:
         log.info(f"Target category: {args.category}")
 
