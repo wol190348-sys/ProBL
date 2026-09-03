@@ -1,0 +1,56 @@
+name: Delete Cloudflare R2 Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      execute:
+        description: "Actually delete images (off = dry-run preview only)"
+        required: false
+        type: boolean
+        default: false
+      confirm:
+        description: 'Type DELETE to confirm when execute is on'
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  delete-images:
+    name: Delete Bleems R2 images
+    runs-on: ubuntu-latest
+
+    env:
+      CF_R2_ACCESS_KEY_ID:     ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+      CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+      CF_R2_ENDPOINT_URL:      ${{ secrets.CF_R2_ENDPOINT_URL }}
+      CF_R2_BUCKET_NAME:       ${{ secrets.CF_R2_BUCKET_NAME }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install --upgrade --cache-dir ~/.cache/pip -r requirements.txt
+
+      - name: Confirm deletion
+        if: ${{ inputs.execute }}
+        run: |
+          if [ "${{ inputs.confirm }}" != "DELETE" ]; then
+            echo "execute is on, but confirm is not DELETE — aborting."
+            echo "Re-run with execute enabled and confirm set to DELETE."
+            exit 1
+          fi
+
+      - name: Delete R2 images
+        run: |
+          if [ "${{ inputs.execute }}" = "true" ]; then
+            python CF/delete_r2_images.py --execute
+          else
+            python CF/delete_r2_images.py
+          fi
