@@ -1,8 +1,17 @@
-name: Delete Cloudflare R2 Images
+name: Delete R2 / S3 Images
 
 on:
   workflow_dispatch:
     inputs:
+      backend:
+        description: "Which object store to delete images from"
+        required: true
+        type: choice
+        options:
+          - r2
+          - s3
+          - both
+        default: both
       execute:
         description: "Actually delete images (off = dry-run preview only)"
         required: false
@@ -16,14 +25,22 @@ on:
 
 jobs:
   delete-images:
-    name: Delete Bleems R2 images
+    name: Delete Bleems images (${{ matrix.backend }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: ${{ inputs.backend == 'both' && fromJSON('["r2","s3"]') || fromJSON(format('["{0}"]', inputs.backend)) }}
 
     env:
       CF_R2_ACCESS_KEY_ID:     ${{ secrets.CF_R2_ACCESS_KEY_ID }}
       CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
       CF_R2_ENDPOINT_URL:      ${{ secrets.CF_R2_ENDPOINT_URL }}
       CF_R2_BUCKET_NAME:       ${{ secrets.CF_R2_BUCKET_NAME }}
+      AWS_ACCESS_KEY_ID:       ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY:   ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION:      us-east-1
+      S3_BUCKET_NAME:          ${{ secrets.S3_BUCKET_NAME }}
 
     steps:
       - name: Checkout repository
@@ -47,10 +64,10 @@ jobs:
             exit 1
           fi
 
-      - name: Delete R2 images
+      - name: Delete ${{ matrix.backend }} images
         run: |
           if [ "${{ inputs.execute }}" = "true" ]; then
-            python CF/delete_r2_images.py --execute
+            python CF/delete_r2_images.py --backend "${{ matrix.backend }}" --execute
           else
-            python CF/delete_r2_images.py
+            python CF/delete_r2_images.py --backend "${{ matrix.backend }}"
           fi

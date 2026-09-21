@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
-Delete existing Bleems images from Cloudflare R2.
+Delete existing Bleems images from Cloudflare R2 and/or AWS S3.
 
 Targets only image objects under the site prefix (default: bleems-data/).
 CSVs, JSON, YAML, and monitor artifacts are never deleted.
 
 Dry-run by default. Pass --execute to actually remove objects.
 
-Environment (same secrets as the R2 scraper workflow):
+Environment for --backend r2 (same secrets as the R2 scraper workflow):
   CF_R2_ACCESS_KEY_ID
   CF_R2_SECRET_ACCESS_KEY
   CF_R2_ENDPOINT_URL
   CF_R2_BUCKET_NAME
+
+Environment for --backend s3 (same secrets as the S3 scraper workflow):
+  AWS_ACCESS_KEY_ID
+  AWS_SECRET_ACCESS_KEY
+  AWS_DEFAULT_REGION   (optional, default us-east-1)
+  S3_BUCKET_NAME
 """
 
 from __future__ import annotations
@@ -35,7 +41,13 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif",
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Delete existing Bleems images from Cloudflare R2"
+        description="Delete existing Bleems images from Cloudflare R2 or AWS S3"
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("r2", "s3"),
+        default="r2",
+        help="Object store to target (default: r2)",
     )
     parser.add_argument(
         "--execute",
@@ -69,6 +81,21 @@ def build_r2_client() -> Any:
             s3={"addressing_style": "path"},
         ),
     )
+
+
+def build_s3_client() -> Any:
+    return boto3.client(
+        "s3",
+        aws_access_key_id=require_env("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=require_env("AWS_SECRET_ACCESS_KEY"),
+        region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+    )
+
+
+def build_client(backend: str) -> tuple[Any, str, str]:
+    if backend == "s3":
+        return build_s3_client(), require_env("S3_BUCKET_NAME"), "AWS S3"
+    return build_r2_client(), require_env("CF_R2_BUCKET_NAME"), "Cloudflare R2"
 
 
 def normalize_prefix(prefix: str) -> str:
@@ -142,6 +169,7 @@ def delete_in_batches(client: Any, bucket: str, keys: list[str]) -> tuple[int, i
 
 def write_step_summary(
     *,
+    backend_label: str,
     bucket: str,
     prefix: str,
     execute: bool,
@@ -156,9 +184,10 @@ def write_step_summary(
     total_bytes = sum(obj["Size"] for obj in images)
     mode = "EXECUTE" if execute else "DRY RUN"
     lines = [
-        "## Delete Cloudflare R2 images",
+        f"## Delete {backend_label} images",
         "",
         f"- **Mode:** {mode}",
+        f"- **Backend:** {backend_label}",
         f"- **Bucket:** `{bucket}`",
         f"- **Prefix:** `{prefix}`",
         f"- **Images found:** {len(images)}",
@@ -190,10 +219,10 @@ def main() -> int:
         datefmt="%H:%M:%S",
     )
     args = parse_args()
-    bucket = require_env("CF_R2_BUCKET_NAME")
     prefix = args.prefix.strip("/") or R2_PREFIX
-    client = build_r2_client()
+    client, bucket, backend_label = build_client(args.backend)
 
+    log.info("Backend: %s", backend_label)
     log.info("Bucket : %s", bucket)
     log.info("Prefix : %s/", prefix)
     log.info("Mode   : %s", "EXECUTE (delete)" if args.execute else "DRY RUN")
@@ -220,6 +249,7 @@ def main() -> int:
         log.info("Dry run — pass --execute to delete these objects.")
 
     write_step_summary(
+        backend_label=backend_label,
         bucket=bucket,
         prefix=prefix,
         execute=args.execute,
